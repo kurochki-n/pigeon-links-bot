@@ -16,6 +16,11 @@ from bot.middlewares.database import DatabaseMiddleware
 from bot.middlewares.workspace import WorkspaceMiddleware
 from bot.services.commands_service import setup_bot_commands
 from bot.services.storage_service import FileStorageService
+from bot.utils.rich_messages import (
+    ORIGINAL_BOT_USERNAME,
+    configure_footer,
+    rich_message,
+)
 from config import settings
 
 log = logging.getLogger(__name__)
@@ -29,8 +34,8 @@ async def on_error(event: ErrorEvent, bot: Bot) -> bool:
     )
     if user:
         try:
-            await bot.send_message(
-                user.id, "Произошла временная ошибка. Попробуйте ещё раз."
+            await bot.send_rich_message(
+                user.id, rich_message("Произошла временная ошибка. Попробуйте ещё раз.", [])
             )
         except TelegramAPIError:
             pass
@@ -50,6 +55,16 @@ async def main() -> None:
     bot = Bot(
         settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
+    me = await bot.get_me()
+    footer_enabled = configure_footer(me.username)
+    log.info("Attribution footer %s for @%s", "enabled" if footer_enabled else "disabled", me.username)
+    if footer_enabled:
+        try:
+            await bot.set_my_description(
+                description=f"Оригинальный бот: @{ORIGINAL_BOT_USERNAME}"
+            )
+        except TelegramAPIError as exc:
+            log.warning("Could not set attribution description: %s", exc)
     await setup_bot_commands(bot)
 
     dp = Dispatcher(storage=MemoryStorage())

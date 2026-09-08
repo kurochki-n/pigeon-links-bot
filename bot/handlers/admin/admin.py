@@ -59,7 +59,7 @@ from bot.services.storage_service import FileStorageService
 from bot.states.flows import ChannelFlow, PostFlow, SmartLinkFlow, SourceFlow
 from bot.utils.admins_json import AdminStore, admin_label
 from bot.utils.html_report import create_report
-from bot.utils.rich_messages import callback_button, url_button
+from bot.utils.rich_messages import callback_button, footer_text, url_button
 from config import settings
 
 router = Router(name="admin")
@@ -930,7 +930,8 @@ async def stats_report(
     )
     try:
         await callback.message.answer_document(
-            FSInputFile(path), caption="HTML-отчёт со статистикой"
+            FSInputFile(path),
+            caption=footer_text("HTML-отчёт со статистикой") or None,
         )
     finally:
         path.unlink(missing_ok=True)

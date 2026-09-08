@@ -18,6 +18,27 @@ class RichButton:
 
 RichButtons = list[list[RichButton]]
 
+ORIGINAL_BOT_USERNAME = "PigeonLinksBot"
+_FOOTER = (
+    '\n\n<blockquote>Оригинальный бот: '
+    '<a href="https://t.me/PigeonLinksBot">@PigeonLinksBot</a></blockquote>'
+)
+_footer_enabled = False
+
+
+def configure_footer(bot_username: str | None) -> bool:
+    """Enable the attribution only for copies of the official bot."""
+    global _footer_enabled
+    _footer_enabled = (bot_username or "").lstrip("@").casefold() != ORIGINAL_BOT_USERNAME.casefold()
+    return _footer_enabled
+
+
+def footer_text(text: str = "") -> str:
+    """Append the attribution once when this bot is not the official instance."""
+    if not _footer_enabled or "Оригинальный бот: @PigeonLinksBot" in text:
+        return text
+    return f"{text.rstrip()}{_FOOTER}"
+
 
 def is_rich_buttons(value: object) -> bool:
     return isinstance(value, list) and all(
@@ -48,7 +69,7 @@ def rich_message(text: str, buttons: RichButtons) -> InputRichMessage:
                 action = f'type="url" url="{escape(button.url or "", quote=True)}"'
             rendered.append(f"<tg-button {action}>{escape(button.text)}</tg-button>")
         rows.append(f"<tg-button-row>{''.join(rendered)}</tg-button-row>")
-    body = text or "<p></p>"
+    body = footer_text(text) or "<p></p>"
     return InputRichMessage(html=f"{body}{''.join(rows)}")
 
 
@@ -65,17 +86,24 @@ async def answer_rich(
 
 
 _message_answer = Message.answer
+_message_edit_text = Message.edit_text
 
 
 async def _answer_with_rich_buttons(
     self: Message, text: str, **kwargs: object
 ) -> Message:
+    """Append attribution to every text reply and retain Telegram reply keyboards."""
     buttons = kwargs.pop("reply_markup", None)
     if is_rich_buttons(buttons):
-        return await self.answer_rich(rich_message(text, buttons))
+        return await self.answer_rich(rich_message(text, buttons), **kwargs)
     if buttons is not None:
         kwargs["reply_markup"] = buttons
-    return await _message_answer(self, text, **kwargs)
+    return await _message_answer(self, footer_text(text), **kwargs)
+
+
+async def _edit_text_with_footer(self: Message, text: str, **kwargs: object) -> Message:
+    return await _message_edit_text(self, footer_text(text), **kwargs)
 
 
 Message.answer = _answer_with_rich_buttons
+Message.edit_text = _edit_text_with_footer

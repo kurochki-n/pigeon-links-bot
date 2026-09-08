@@ -19,7 +19,7 @@ from bot.database.repositories.repositories import (
 )
 from bot.keyboards.keyboards import github_download_keyboard
 from bot.services.storage_service import FileStorageService
-from bot.utils.rich_messages import RichButtons, rich_message
+from bot.utils.rich_messages import RichButtons, footer_text, rich_message
 
 log = logging.getLogger(__name__)
 
@@ -132,10 +132,10 @@ async def send_link_content(
                 chat_id, rich_message(message_text or "", buttons)
             )
         else:
-            await bot.send_message(chat_id, message_text or "")
+            await bot.send_rich_message(chat_id, rich_message(message_text or "", []))
         return
     if message_text:
-        await bot.send_message(chat_id, message_text)
+        await bot.send_rich_message(chat_id, rich_message(message_text, []))
     local_path = getattr(link, "relative_path", None)
     if storage and local_path and not await storage.exists(local_path):
         raise FileNotFoundError(local_path)
@@ -151,16 +151,16 @@ async def send_link_content(
         if buttons:
             await bot.send_rich_message(chat_id, rich_message(text or "", buttons))
         else:
-            await bot.send_message(chat_id, text or "")
+            await bot.send_rich_message(chat_id, rich_message(text or "", []))
         return
     if kind == "photo":
-        await bot.send_photo(chat_id, local_file or file_id or "", caption=caption)
+        await bot.send_photo(chat_id, local_file or file_id or "", caption=footer_text(caption or "") or None)
     elif kind == "video":
-        await bot.send_video(chat_id, local_file or file_id or "", caption=caption)
+        await bot.send_video(chat_id, local_file or file_id or "", caption=footer_text(caption or "") or None)
     elif kind == "document":
-        await bot.send_document(chat_id, local_file or file_id or "", caption=caption)
+        await bot.send_document(chat_id, local_file or file_id or "", caption=footer_text(caption or "") or None)
     elif kind == "animation":
-        await bot.send_animation(chat_id, local_file or file_id or "", caption=caption)
+        await bot.send_animation(chat_id, local_file or file_id or "", caption=footer_text(caption or "") or None)
     if buttons:
         await bot.send_rich_message(chat_id, rich_message("", buttons))
 
@@ -179,13 +179,13 @@ async def send_stored_file(
     else:
         raise FileNotFoundError(local_path or "missing fallback file")
     if file.file_type == "photo":
-        await bot.send_photo(chat_id, source)
+        await bot.send_photo(chat_id, source, caption=footer_text() or None)
     elif file.file_type == "video":
-        await bot.send_video(chat_id, source)
+        await bot.send_video(chat_id, source, caption=footer_text() or None)
     elif file.file_type == "animation":
-        await bot.send_animation(chat_id, source)
+        await bot.send_animation(chat_id, source, caption=footer_text() or None)
     else:
-        await bot.send_document(chat_id, source)
+        await bot.send_document(chat_id, source, caption=footer_text() or None)
 
 
 class LinkService:
