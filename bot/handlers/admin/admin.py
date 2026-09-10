@@ -1,5 +1,10 @@
+import hashlib
+import secrets
+from datetime import UTC, datetime, timedelta
+from html import escape
+
 from aiogram import Bot, F, Router
-from aiogram.enums import ChatMemberStatus
+from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -7,19 +12,21 @@ from aiogram.types import (
     CallbackQuery,
     FSInputFile,
     Message,
-    ReplyKeyboardRemove,
 )
+from aiogram.utils.token import TokenValidationError
 from pydantic import HttpUrl, TypeAdapter, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.database.repositories.repositories import (
+    ChannelConnectTokenRepository,
     ChannelRepository,
+    DeliveryBotRepository,
+    FallbackFileRepository,
     LinkRepository,
     SourceRepository,
     VisitRepository,
 )
 from bot.keyboards.callbacks import (
-    AdminCallback,
     ChannelCallback,
     LinkCallback,
     MaterialCallback,
@@ -28,12 +35,9 @@ from bot.keyboards.callbacks import (
     StatsCallback,
 )
 from bot.keyboards.keyboards import (
-    CHANNEL_REQUEST_ID,
     channel_menu,
-    channel_selector,
     confirm,
     fallback_files_menu,
-    github_preview_keyboard,
     link_actions,
     link_preview,
     links_page,
@@ -45,27 +49,32 @@ from bot.keyboards.keyboards import (
     source_actions,
     stats_menu,
 )
-from bot.services.commands_service import remove_admin_commands
+from bot.services.delivery_bot_manager import DeliveryBotManager
 from bot.services.github_service import GithubService
 from bot.services.services import (
-    AdminInviteService,
-    ChannelSetupService,
     LinkService,
     TrafficSourceService,
     send_link_content,
     stats_text,
 )
 from bot.services.storage_service import FileStorageService
-from bot.states.flows import ChannelFlow, PostFlow, SmartLinkFlow, SourceFlow
-from bot.utils.admins_json import AdminStore, admin_label
+from bot.services.token_cipher import TokenCipher
+from bot.states.flows import DeliveryBotFlow, PostFlow, SmartLinkFlow, SourceFlow
 from bot.utils.html_report import create_report
-from bot.utils.rich_messages import callback_button, url_button
+from bot.utils.rich_messages import callback_button, inline_keyboard, url_button
 from config import settings
 
 router = Router(name="admin")
+router.message.filter(F.chat.type == ChatType.PRIVATE)
+router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+
+MAX_MESSAGE_TEXT_LENGTH = 3500
+MAX_POST_BUTTONS = 100
+MAX_FALLBACK_FILES = 8
+MAX_SOURCES_PER_LINK = 100
 
 
-def content(message: Message) -> dict[str, str | None] | None:
+def content(message: Message) -> dict[str, object] | None:
     if message.text:
         return {
             "content_type": "text",
@@ -87,15 +96,16 @@ def content(message: Message) -> dict[str, str | None] | None:
             return {
                 "content_type": kind,
                 "text": None,
-                "caption": message.html_caption,
+                "caption": message.html_text,
                 "file_id": value.file_id,
                 "original_filename": original_filename,
                 "mime_type": getattr(value, "mime_type", None),
+                "file_size": getattr(value, "file_size", None),
             }
     return None
 
 
-def fallback_file(message: Message, position: int) -> dict[str, str | None] | None:
+def fallback_file(message: Message, position: int) -> dict[str, object] | None:
     for field, kind in [
         ("photo", "photo"),
         ("video", "video"),
@@ -115,195 +125,256 @@ def fallback_file(message: Message, position: int) -> dict[str, str | None] | No
                 "file_name": name,
                 "original_filename": name,
                 "mime_type": getattr(value, "mime_type", None),
+                "file_size": getattr(value, "file_size", None),
             }
     return None
+
+
+def file_is_too_large(file: dict[str, object]) -> bool:
+    size = file.get("file_size")
+    return isinstance(size, int) and size > settings.max_telegram_file_size
 
 
 async def cleanup_link_draft(state: FSMContext, storage: FileStorageService) -> None:
     data = await state.get_data()
     content = data.get("content", {})
     await storage.delete(content.get("relative_path"))
+    for item in data.get("content_items", []):
+        await storage.delete(item.get("relative_path"))
     for file in data.get("fallback_files", []):
         await storage.delete(file.get("relative_path"))
 
 
-def url(bot_username: str, slug: str) -> str:
-    return f"https://t.me/{bot_username}?start={slug}"
+async def cleanup_post_draft(state: FSMContext, storage: FileStorageService) -> None:
+    data = await state.get_data()
+    for item in data.get("content_items", []):
+        await storage.delete(item.get("relative_path"))
+    await storage.delete(data.get("content", {}).get("relative_path"))
 
 
-@router.message(Command("admin"))
-async def admins(message: Message) -> None:
+async def delivery_url(session: AsyncSession, payload: str) -> str:
+    delivery_bot = await DeliveryBotRepository(session).get()
+    if delivery_bot is None:
+        raise RuntimeError("Delivery bot is not configured")
+    return f"https://t.me/{delivery_bot.username}?start={payload}"
+
+
+@router.message(Command("cancel"))
+async def cancel(
+    message: Message, state: FSMContext, storage: FileStorageService
+) -> None:
+    current_state = await state.get_state()
+    if current_state:
+        smart_link_states = {
+            SmartLinkFlow.name.state,
+            SmartLinkFlow.message.state,
+            SmartLinkFlow.material_type.state,
+            SmartLinkFlow.content.state,
+            SmartLinkFlow.resources.state,
+            SmartLinkFlow.github_url.state,
+            SmartLinkFlow.github_fallbacks.state,
+            SmartLinkFlow.preview.state,
+        }
+        if current_state in smart_link_states:
+            await cleanup_link_draft(state, storage)
+        post_states = {
+            PostFlow.content.state,
+            PostFlow.button_choice.state,
+            PostFlow.button_text.state,
+            PostFlow.button_url.state,
+            PostFlow.button_more.state,
+            PostFlow.preview.state,
+        }
+        if current_state in post_states:
+            await cleanup_post_draft(state, storage)
+        await state.clear()
+        await message.answer("Действие отменено.")
+    else:
+        await message.answer(
+            "Сейчас нечего отменять. Начните с /bot, чтобы подключить бота для подписчиков."
+        )
+
+
+@router.message(Command("start"))
+async def dashboard(message: Message) -> None:
     await message.answer(
-        "У каждого пользователя свой кабинет. Помощники не поддерживаются."
+        "<b>Это бот настроек.</b>\n\n"
+        "Сначала подключите отдельного бота для подписчиков: /bot\n"
+        "Затем подключите канал: /channel\n"
+        "После этого создайте ссылку с материалом: /add\n\n"
+        "/links — ваши ссылки\n/stats — результаты\n/post — публикация в канал\n"
+        "/cancel — отменить текущий шаг"
     )
 
 
-@router.callback_query(AdminCallback.filter(F.action == "add"))
-async def add_admin(callback: CallbackQuery, bot: Bot, session: AsyncSession) -> None:
-    await callback.answer()
-    token = await AdminInviteService(session).create(callback.from_user.id)
-    me = await bot.get_me()
-    await callback.message.answer(
-        f"Отправьте человеку одноразовую ссылку (действует 24 часа):\n<code>https://t.me/{me.username}?start=admin_{token}</code>"
-    )
-
-
-@router.callback_query(AdminCallback.filter(F.action == "remove"))
-async def choose_admin(callback: CallbackQuery, admin_store: AdminStore) -> None:
-    await callback.answer()
-    items = await admin_store.list_admins()
-    kb = [
-        [
-            callback_button(
-                f"Удалить {admin_label(x)}",
-                AdminCallback(action="ask", target_id=x["telegram_id"]).pack(),
-            )
-        ]
-        for x in items
-    ]
-    await callback.message.answer("Выберите администратора:", reply_markup=kb)
-
-
-@router.callback_query(AdminCallback.filter(F.action == "ask"))
-async def ask_remove_admin(
-    callback: CallbackQuery, callback_data: AdminCallback, admin_store: AdminStore
+@router.message(Command("bot"))
+async def delivery_bot_setup(
+    message: Message, state: FSMContext, session: AsyncSession
 ) -> None:
-    await callback.answer()
-    item = next(
-        (
-            a
-            for a in await admin_store.list_admins()
-            if a["telegram_id"] == callback_data.target_id
-        ),
-        None,
+    current = await DeliveryBotRepository(session).get()
+    current_text = (
+        f"\n\nСейчас подключён: @{escape(current.username)}. Новый токен заменит этого бота. Старые опубликованные ссылки нужно будет заменить."
+        if current
+        else ""
     )
-    if not item:
-        await callback.message.answer("Администратор уже удалён.")
-        return
-    kb = [
-        [
-            callback_button(
-                "Да, удалить",
-                AdminCallback(action="yes", target_id=callback_data.target_id).pack(),
-            ),
-            callback_button("Отмена", AdminCallback(action="no").pack()),
-        ]
-    ]
-    await callback.message.answer(f"Удалить {admin_label(item)}?", reply_markup=kb)
+    await state.set_state(DeliveryBotFlow.token)
+    await message.answer(
+        "<b>Подключение бота для подписчиков</b>\n\n"
+        "1. Откройте @BotFather.\n"
+        "2. Отправьте /newbot и создайте нового бота.\n"
+        "3. Скопируйте токен, который пришлёт BotFather.\n"
+        "4. Пришлите этот токен сюда одним сообщением.\n\n"
+        "Токен выглядит примерно так: <code>123456789:AA...</code>. "
+        "Бот удалит ваше сообщение с токеном и сохранит его в зашифрованном виде."
+        f"{current_text}"
+    )
 
 
-@router.callback_query(AdminCallback.filter(F.action == "no"))
-async def cancel_remove_admin(callback: CallbackQuery) -> None:
-    await callback.answer("Отменено")
-
-
-@router.callback_query(AdminCallback.filter(F.action == "yes"))
-async def remove_admin(
-    callback: CallbackQuery,
-    callback_data: AdminCallback,
-    admin_store: AdminStore,
+@router.message(DeliveryBotFlow.token)
+async def save_delivery_bot(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
     bot: Bot,
+    token_cipher: TokenCipher,
+    delivery_manager: DeliveryBotManager,
+    commit_cleanups: list,
 ) -> None:
-    await callback.answer()
-    ok = await admin_store.remove(callback_data.target_id)
-    if ok:
-        await remove_admin_commands(bot, callback_data.target_id)
-    await callback.message.answer(
-        "Администратор удалён."
-        if ok
-        else "Нельзя удалить единственного администратора."
+    token = (message.text or "").strip()
+    token_message_deleted = True
+    try:
+        await message.delete()
+    except TelegramAPIError:
+        token_message_deleted = False
+    delete_warning = (
+        "\n\n⚠️ Telegram не разрешил удалить сообщение с токеном. Удалите его вручную из чата."
+        if not token_message_deleted
+        else ""
+    )
+    candidate: Bot | None = None
+    try:
+        candidate = Bot(token)
+        info = await candidate.get_me()
+    except (TelegramAPIError, TokenValidationError, ValueError):
+        await message.answer(
+            "Токен не подошёл. Скопируйте его заново из @BotFather и пришлите без пробелов и кавычек."
+            f"{delete_warning}"
+        )
+        return
+    finally:
+        if candidate is not None:
+            await candidate.session.close()
+    if info.id == (await bot.get_me()).id:
+        await message.answer(
+            "Нельзя подключить бот настроек к самому себе. Создайте отдельного бота через @BotFather."
+            f"{delete_warning}"
+        )
+        return
+    repository = DeliveryBotRepository(session)
+    current = await repository.get()
+    used = await repository.by_bot_id(info.id)
+    if used and used.owner_id != message.from_user.id:
+        await message.answer(
+            "Этот бот уже подключён к другому кабинету. Создайте другого бота через @BotFather."
+            f"{delete_warning}"
+        )
+        return
+    bot_changed = current is not None and current.bot_id != info.id
+    channel_must_reconnect = current is None or bot_changed
+    await repository.save(
+        info.id, info.username or str(info.id), token_cipher.encrypt(token)
+    )
+    if channel_must_reconnect:
+        await ChannelRepository(session).delete()
+    await state.clear()
+    commit_cleanups.append(
+        lambda: delivery_manager.replace(message.from_user.id, token)
+    )
+    warning = (
+        "\n\nВы заменили бота. Старый канал отключён, а опубликованные ранее ссылки ведут к старому боту. Подключите канал заново и замените ссылки в публикациях."
+        if bot_changed
+        else ""
+    )
+    await message.answer(
+        f"✅ Бот @{escape(info.username or str(info.id))} подключён и запускается."
+        f"{warning}{delete_warning}\n\nТеперь отправьте /channel, чтобы подключить канал."
+    )
+
+
+async def send_channel_connection_link(
+    target: Message,
+    session: AsyncSession,
+    delivery_manager: DeliveryBotManager,
+    owner_id: int,
+) -> None:
+    delivery_bot = await DeliveryBotRepository(session).get()
+    if delivery_bot is None:
+        await target.answer(
+            "Сначала подключите отдельного бота для подписчиков с помощью команды /bot."
+        )
+        return
+    if delivery_manager.get_bot(owner_id) is None:
+        await target.answer(
+            "Бот для подписчиков сейчас не запущен. Подключите его заново с помощью команды /bot."
+        )
+        return
+    token = secrets.token_urlsafe(24)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    await ChannelConnectTokenRepository(session).create(
+        token_hash,
+        owner_id,
+        datetime.now(UTC) + timedelta(minutes=15),
+    )
+    connect_url = f"https://t.me/{delivery_bot.username}?start=connect_{token}"
+    await target.answer(
+        f"<b>Подключение канала к @{escape(delivery_bot.username)}</b>\n\n"
+        "Нажмите кнопку ниже. Откроется бот для подписчиков и покажет следующие шаги. "
+        "Ссылка действует 15 минут и подходит только вашему аккаунту.",
+        reply_markup=inline_keyboard(
+            [[url_button("Продолжить подключение канала", connect_url)]]
+        ),
     )
 
 
 @router.message(Command("channel"))
 async def channel(
-    message: Message, session: AsyncSession, bot: Bot, state: FSMContext
+    message: Message,
+    session: AsyncSession,
+    delivery_manager: DeliveryBotManager,
 ) -> None:
-    item = await ChannelRepository(session).get()
-    if not item:
-        await state.set_state(ChannelFlow.value)
-        await state.update_data(channel_request_id=CHANNEL_REQUEST_ID)
+    if await DeliveryBotRepository(session).get() is None:
         await message.answer(
-            "<b>Сначала подключите канал.</b>\n\n"
-            "1. Откройте свой канал и добавьте этого бота как администратора.\n"
-            "2. Разрешите ему публиковать сообщения.\n"
-            "3. Вернитесь сюда и нажмите «Выбрать канал» внизу экрана.\n\n"
-            "Если канал закрытый, разрешите боту создавать пригласительные ссылки.",
-            reply_markup=channel_selector(),
+            "Сначала подключите отдельного бота для подписчиков с помощью команды /bot."
         )
         return
-    try:
-        status = (
-            await bot.get_chat_member(item.channel_id, (await bot.get_me()).id)
-        ).status
-        checked = (
-            "✅ администратор"
-            if status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
-            else "❌ не администратор"
+    if delivery_manager.get_bot(message.from_user.id) is None:
+        await message.answer(
+            "Бот для подписчиков сейчас не запущен. Подключите его заново через /bot."
         )
-    except TelegramAPIError:
-        checked = "❌ недоступен"
+        return
+    item = await ChannelRepository(session).get()
+    if item is None:
+        await send_channel_connection_link(
+            message, session, delivery_manager, message.from_user.id
+        )
+        return
     await message.answer(
-        f"<b>Канал</b>\n\nНазвание: {item.title}\nUsername: @{item.username or '—'}\nID: <code>{item.channel_id}</code>\n\nБот: {checked}",
+        f"<b>Подключённый канал</b>\n\nНазвание: {escape(item.title)}\n"
+        f"Имя в Telegram: {escape('@' + item.username if item.username else 'не задано')}\n"
+        f"Внутренний номер: <code>{item.channel_id}</code>",
         reply_markup=channel_menu(True),
     )
 
 
 @router.callback_query(ChannelCallback.filter(F.action.in_({"add", "change"})))
-async def channel_input(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    await state.set_state(ChannelFlow.value)
-    await state.update_data(channel_request_id=CHANNEL_REQUEST_ID)
-    await callback.message.answer(
-        "Добавьте бота в новый канал как администратора и разрешите ему публиковать сообщения. Затем нажмите «Выбрать канал» внизу экрана.",
-        reply_markup=channel_selector(),
-    )
-
-
-@router.message(ChannelFlow.value, F.chat_shared)
-async def channel_save(
-    message: Message, state: FSMContext, session: AsyncSession, bot: Bot
+async def channel_input(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    delivery_manager: DeliveryBotManager,
 ) -> None:
-    shared = message.chat_shared
-    data = await state.get_data()
-    if shared.request_id != data.get("channel_request_id"):
-        await message.answer("Это устаревший запрос выбора канала.")
-        return
-
-    result = await ChannelSetupService(bot).validate(shared.chat_id)
-    if not result.is_valid:
-        await state.clear()
-        await message.answer(
-            "Не получилось подключить канал.\n\n"
-            "Проверьте, что бот добавлен в этот канал как администратор и может публиковать сообщения. "
-            "Для закрытого канала также разрешите ему создавать пригласительные ссылки. Затем попробуйте ещё раз.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-
-    await ChannelRepository(session).save(
-        channel_id=shared.chat_id,
-        title=result.title or str(shared.chat_id),
-        username=result.username,
-        invite_url=result.invite_url,
-    )
-    await state.clear()
-    await message.answer(
-        "✅ Канал подключён! Теперь отправьте /add, чтобы создать ссылку и выдать материал подписчикам.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@router.message(ChannelFlow.value, F.text == "Отмена")
-async def cancel_channel_selection(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
-
-
-@router.message(ChannelFlow.value)
-async def channel_selection_hint(message: Message) -> None:
-    await message.answer(
-        "Нажмите кнопку «Выбрать канал» внизу экрана. Telegram покажет список ваших каналов."
+    await callback.answer()
+    await send_channel_connection_link(
+        callback.message, session, delivery_manager, callback.from_user.id
     )
 
 
@@ -317,7 +388,27 @@ async def channel_delete(callback: CallbackQuery, session: AsyncSession) -> None
 
 
 @router.message(Command("add"))
-async def add_link(message: Message, state: FSMContext) -> None:
+async def add_link(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    delivery_manager: DeliveryBotManager,
+) -> None:
+    if not await DeliveryBotRepository(session).get():
+        await message.answer(
+            "Сначала подключите отдельного бота для подписчиков с помощью команды /bot."
+        )
+        return
+    if delivery_manager.get_bot(message.from_user.id) is None:
+        await message.answer(
+            "Бот для подписчиков сейчас не запущен. Подключите его заново через /bot."
+        )
+        return
+    if not await ChannelRepository(session).get():
+        await message.answer(
+            "Сначала подключите канал, подписку на который будет проверять бот. Отправьте /channel и выполните три шага на экране."
+        )
+        return
     await state.set_state(SmartLinkFlow.name)
     await message.answer(
         "<b>Создадим ссылку для выдачи материала.</b>\n\n"
@@ -328,21 +419,41 @@ async def add_link(message: Message, state: FSMContext) -> None:
 
 @router.message(SmartLinkFlow.name)
 async def link_name(message: Message, state: FSMContext) -> None:
-    if not message.text or len(message.text) > 128:
-        await message.answer("Введите название до 128 символов.")
+    name = (message.text or "").strip()
+    if not name or len(name) > 128:
+        await message.answer(
+            "Напишите непустое название длиной до 128 символов. Например: «Подарок с сайта»."
+        )
         return
-    await state.update_data(name=message.text)
-    await state.set_state(SmartLinkFlow.message)
+    await state.update_data(name=name, content_items=[], resources=[])
+    await state.set_state(SmartLinkFlow.content)
     await message.answer(
-        "Теперь напишите сообщение для человека. Он увидит его после подписки вместе с материалом.\n\n"
-        "Например: «Спасибо за подписку! Вот ваш подарок»."
+        "Теперь пришлите готовое сообщение для подписчика. Можно отправить текст, фото, видео, GIF и документы — несколькими сообщениями в нужном порядке. У фото или видео можно добавить подпись.\n\n"
+        "Когда добавите всё, нажмите «Готово — перейти к ссылкам».",
+        reply_markup=inline_keyboard(
+            [
+                [
+                    callback_button(
+                        "Готово — перейти к ссылкам",
+                        MaterialCallback(action="content_done").pack(),
+                    )
+                ]
+            ]
+        ),
     )
 
 
-@router.message(SmartLinkFlow.message)
+@router.message(F.text == "__legacy_link_message__")
 async def link_message(message: Message, state: FSMContext) -> None:
-    if not message.text:
-        await message.answer("Сообщение должно быть текстом. Отправьте его ещё раз.")
+    if not (message.text or "").strip():
+        await message.answer(
+            "Пришлите обычное текстовое сообщение, которое увидит человек."
+        )
+        return
+    if len(message.text) > MAX_MESSAGE_TEXT_LENGTH:
+        await message.answer(
+            f"Сообщение слишком длинное. Сократите его до {MAX_MESSAGE_TEXT_LENGTH} символов."
+        )
         return
     await state.update_data(message_text=message.html_text)
     await state.set_state(SmartLinkFlow.material_type)
@@ -419,9 +530,17 @@ async def link_content(
 ) -> None:
     item = content(message)
     if not item:
-        await message.answer("Поддерживаются текст, фото, видео, документ и animation.")
+        await message.answer(
+            "Я не могу использовать сообщение такого типа. Пришлите текст, фото, видео, документ или GIF."
+        )
         return
     if item["content_type"] != "text":
+        if file_is_too_large(item):
+            limit_mb = settings.max_telegram_file_size // (1024 * 1024)
+            await message.answer(
+                f"Этот файл слишком большой. Пришлите файл размером не больше {limit_mb} МБ."
+            )
+            return
         try:
             stored = await storage.save_telegram_file(
                 bot,
@@ -443,33 +562,115 @@ async def link_content(
             file_size=stored.file_size,
         )
         rollback_cleanups.append(lambda: storage.delete(stored.relative_path))
-    item.update(github_owner=None, github_repo=None, github_url=None)
-    await state.update_data(content=item)
-    await show_link_preview(message, state, bot, storage)
+    data = await state.get_data()
+    items = data.get("content_items", [])
+    items.append(item)
+    await state.update_data(content_items=items)
+    await message.answer(
+        f"Добавлено сообщений: {len(items)}. Пришлите следующее или нажмите «Готово — перейти к ссылкам»."
+    )
+
+
+@router.callback_query(
+    MaterialCallback.filter(F.action == "content_done"), SmartLinkFlow.content
+)
+async def finish_link_content(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if not (await state.get_data()).get("content_items"):
+        await callback.message.answer(
+            "Сначала пришлите хотя бы одно сообщение или файл."
+        )
+        return
+    await state.set_state(SmartLinkFlow.resources)
+    await callback.message.answer(
+        "Добавьте ссылки, которые увидит подписчик. Пришлите ссылку на GitHub — по ней будет доступен свежий ZIP-архив. Любая другая ссылка станет обычной кнопкой.\n\n"
+        "Можно добавлять сколько угодно ссылок. Когда закончите, нажмите «Готово — посмотреть».",
+        reply_markup=inline_keyboard(
+            [
+                [
+                    callback_button(
+                        "Готово — посмотреть",
+                        MaterialCallback(action="resources_done").pack(),
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+@router.message(SmartLinkFlow.resources)
+async def add_link_resource(message: Message, state: FSMContext) -> None:
+    raw_url = (message.text or "").strip()
+    try:
+        parsed_url = TypeAdapter(HttpUrl).validate_python(raw_url)
+    except ValidationError:
+        await message.answer(
+            "Пришлите корректную ссылку, начинающуюся с http:// или https://."
+        )
+        return
+    resources = (await state.get_data()).get("resources", [])
+    github = await GithubService(settings.max_telegram_file_size).validate_repository(
+        raw_url
+    )
+    if github.status == "ok" and github.repository:
+        repository = github.repository
+        resource = {
+            "resource_type": "github",
+            "title": "Скачать ZIP-архив",
+            "url": repository.url,
+            "github_owner": repository.owner,
+            "github_repo": repository.repo,
+        }
+    else:
+        host = parsed_url.host or "ссылку"
+        resource = {
+            "resource_type": "url",
+            "title": f"Открыть {host}",
+            "url": str(parsed_url),
+            "github_owner": None,
+            "github_repo": None,
+        }
+    resources.append(resource)
+    await state.update_data(resources=resources)
+    await message.answer(
+        f"Ссылка добавлена. Всего ссылок: {len(resources)}. Пришлите следующую или нажмите «Готово — посмотреть»."
+    )
+
+
+@router.callback_query(
+    MaterialCallback.filter(F.action == "resources_done"), SmartLinkFlow.resources
+)
+async def finish_link_resources(
+    callback: CallbackQuery, state: FSMContext, bot: Bot, storage: FileStorageService
+) -> None:
+    await callback.answer()
+    await show_link_preview(callback.message, state, bot, storage)
 
 
 @router.message(SmartLinkFlow.github_url)
 async def github_url_input(message: Message, state: FSMContext, bot: Bot) -> None:
     validation = await GithubService(
-        settings.max_github_archive_size
+        settings.max_telegram_file_size
     ).validate_repository(message.text or "")
     if validation.status == "invalid_url":
         await message.answer(
-            "Укажите ссылку на корень репозитория: https://github.com/owner/repository"
+            "Пришлите ссылку на главную страницу проекта, например: https://github.com/owner/project"
         )
         return
     if validation.status == "not_found":
         await message.answer(
-            "Репозиторий не найден. Проверьте ссылку и попробуйте снова."
+            "Проект GitHub не найден. Проверьте, что ссылка верная и проект открыт для всех."
         )
         return
     if validation.status == "private":
         await message.answer(
-            "Сейчас поддерживаются только публичные GitHub-репозитории."
+            "Закрытые проекты GitHub не поддерживаются. Сделайте проект публичным или выберите обычный файл."
         )
         return
     if validation.status != "ok" or not validation.repository:
-        await message.answer("Не удалось проверить GitHub. Попробуйте немного позже.")
+        await message.answer(
+            "GitHub сейчас не отвечает. Подождите немного и пришлите ссылку ещё раз."
+        )
         return
     repository = validation.repository
     await state.update_data(
@@ -486,9 +687,9 @@ async def github_url_input(message: Message, state: FSMContext, bot: Bot) -> Non
     )
     await state.set_state(SmartLinkFlow.github_fallbacks)
     await message.answer(
-        "Теперь загрузите резервные файлы.\n\n"
-        "Они будут отправлены пользователю только в том случае, если бот не сможет скачать "
-        "актуальный ZIP-архив с GitHub.",
+        "Теперь пришлите хотя бы один резервный файл.\n\n"
+        "Бот отправит его только в том случае, если не сможет скачать свежий архив с GitHub. "
+        "Можно добавить несколько файлов. После загрузки нажмите «Готово — продолжить».",
         reply_markup=fallback_files_menu(),
     )
 
@@ -503,10 +704,21 @@ async def add_github_fallback_file(
 ) -> None:
     data = await state.get_data()
     files = data.get("fallback_files", [])
+    if len(files) >= MAX_FALLBACK_FILES:
+        await message.answer(
+            f"Можно добавить не больше {MAX_FALLBACK_FILES} резервных файлов. Нажмите «Готово — продолжить»."
+        )
+        return
     file = fallback_file(message, len(files))
     if not file:
         await message.answer(
-            "Отправьте фото, видео, документ или animation. Затем нажмите «Готово»."
+            "Пришлите фото, видео, документ или GIF. Когда добавите все резервные файлы, нажмите «Готово — продолжить»."
+        )
+        return
+    if file_is_too_large(file):
+        limit_mb = settings.max_telegram_file_size // (1024 * 1024)
+        await message.answer(
+            f"Этот файл слишком большой. Пришлите файл размером не больше {limit_mb} МБ."
         )
         return
     try:
@@ -545,7 +757,9 @@ async def finish_github_fallbacks(
     await callback.answer()
     data = await state.get_data()
     if not data.get("fallback_files"):
-        await callback.message.answer("Добавьте хотя бы один резервный файл.")
+        await callback.message.answer(
+            "Сначала пришлите хотя бы один резервный файл. После этого нажмите «Готово — продолжить»."
+        )
         return
     await show_link_preview(callback.message, state, bot)
 
@@ -570,31 +784,18 @@ async def show_link_preview(
     storage: FileStorageService | None = None,
 ) -> None:
     data = await state.get_data()
-    material = data["content"]
-    kind = material["content_type"]
-    if kind == "github_repository":
-        await message.answer(
-            "<b>Предпросмотр умной ссылки</b>\n\n"
-            f"<b>Название:</b> {data['name']}\n\n"
-            f"<b>Сообщение:</b>\n{data['message_text']}\n\n"
-            f"<b>Материал:</b> GitHub — {material['github_owner']}/{material['github_repo']}\n"
-            f"<b>Резервных файлов:</b> {len(data.get('fallback_files', []))}",
-            reply_markup=github_preview_keyboard(),
-        )
-    elif kind == "none":
-        await message.answer(
-            "<b>Предпросмотр умной ссылки</b>\n\n"
-            f"<b>Название:</b> {data['name']}\n\n{data['message_text']}"
-        )
-    else:
-        await message.answer("Предпросмотр сообщения:")
-        preview = {**material, "message_text": data["message_text"]}
+    await message.answer("<b>Предпросмотр для подписчика:</b>")
+    for item in data.get("content_items", []):
         await send_link_content(
-            bot, message.chat.id, type("C", (), preview)(), storage=storage
+            bot, message.chat.id, type("C", (), item)(), storage=storage
         )
+    resources = data.get("resources", [])
+    if resources:
+        summary = "\n".join(f"• {escape(resource['title'])}" for resource in resources)
+        await message.answer("<b>После сообщения будут кнопки:</b>\n" + summary)
     await state.set_state(SmartLinkFlow.preview)
     await message.answer(
-        "Проверьте сообщение выше. Если всё верно, нажмите «Сохранить и получить ссылку».\n"
+        "Проверьте сообщения выше. Если всё верно, нажмите «Сохранить и получить ссылку».\n"
         "До нажатия этой кнопки ссылка ещё не создана.",
         reply_markup=link_preview(),
     )
@@ -602,7 +803,7 @@ async def show_link_preview(
 
 @router.callback_query(LinkCallback.filter(F.action == "preview_github"))
 async def preview_github_download(callback: CallbackQuery) -> None:
-    await callback.answer("Сначала сохраните умную ссылку.")
+    await callback.answer("Это только пример. Сначала сохраните ссылку.")
 
 
 @router.callback_query(LinkCallback.filter(F.action == "save"), SmartLinkFlow.preview)
@@ -610,32 +811,42 @@ async def save_link(
     callback: CallbackQuery,
     state: FSMContext,
     session: AsyncSession,
-    bot: Bot,
     storage: FileStorageService,
     rollback_cleanups: list,
 ) -> None:
     await callback.answer()
     data = await state.get_data()
-    content = data.get("content", {})
-    if content.get("relative_path"):
-        rollback_cleanups.append(lambda: storage.delete(content["relative_path"]))
-    for file in data.get("fallback_files", []):
-        if file.get("relative_path"):
+    for item in data.get("content_items", []):
+        if item.get("relative_path"):
             rollback_cleanups.append(
-                lambda path=file["relative_path"]: storage.delete(path)
+                lambda path=item["relative_path"]: storage.delete(path)
             )
-    content_data = {**data["content"], "message_text": data["message_text"]}
     link = await LinkService(session).create(
         data["name"],
-        content_data,
+        {
+            "content_type": "none",
+            "message_text": None,
+            "text": None,
+            "caption": None,
+            "file_id": None,
+            "relative_path": None,
+            "original_filename": None,
+            "mime_type": None,
+            "file_size": None,
+            "github_owner": None,
+            "github_repo": None,
+            "github_url": None,
+        },
         callback.from_user.id,
-        data.get("fallback_files"),
+        content_items=data.get("content_items", []),
+        resources=data.get("resources", []),
     )
-    me = await bot.get_me()
-    target = url(me.username, link.slug)
+    target = await delivery_url(session, link.slug)
     await state.clear()
     await callback.message.answer(
-        f"Умная ссылка создана.\n\nНазвание: {link.name}\nСсылка:\n<code>{target}</code>",
+        f"✅ Ссылка создана!\n\nНазвание: {escape(link.name)}\n"
+        f"Ссылка для людей:\n<code>{target}</code>\n\n"
+        "Скопируйте её и разместите в посте, рекламе или сообщении.",
         reply_markup=link_actions(link.id, target),
     )
 
@@ -650,20 +861,30 @@ async def restart_link(
     await cleanup_link_draft(state, storage)
     await state.clear()
     await state.set_state(SmartLinkFlow.name)
-    await callback.message.answer("Введите новое название умной ссылки.")
+    await callback.message.answer(
+        "Начнём заново. Напишите понятное название ссылки для себя."
+    )
 
 
 @router.message(Command("links"))
 async def links(message: Message, session: AsyncSession) -> None:
+    if await DeliveryBotRepository(session).get() is None:
+        await message.answer(
+            "Сначала подключите бота для подписчиков с помощью команды /bot."
+        )
+        return
     await show_links(message, session, 0)
 
 
 async def show_links(message: Message, session: AsyncSession, page: int) -> None:
+    page = max(page, 0)
     items, total = await LinkRepository(session).page(page)
-    await message.answer(
-        f"<b>Умные ссылки</b>\nВсего активных: {total}\nВыберите ссылку:",
-        reply_markup=links_page(items, page),
+    text = (
+        f"<b>Ваши ссылки</b>\n\nАктивных ссылок: {total}. Выберите нужную:"
+        if items
+        else "У вас пока нет активных ссылок. Отправьте /add, чтобы создать первую."
     )
+    await message.answer(text, reply_markup=links_page(items, page, total))
 
 
 @router.callback_query(LinkCallback.filter(F.action == "page"))
@@ -679,7 +900,6 @@ async def link_show(
     callback: CallbackQuery,
     callback_data: LinkCallback,
     session: AsyncSession,
-    bot: Bot,
 ) -> None:
     await callback.answer()
     link = await LinkRepository(session).get(callback_data.link_id, True)
@@ -687,9 +907,8 @@ async def link_show(
         await callback.message.answer("Эта ссылка больше не существует.")
         return
     data = await VisitRepository(session).summary(link.id)
-    me = await bot.get_me()
     material = (
-        f"\n\nТип: GitHub repository\nРепозиторий: {link.github_owner}/{link.github_repo}"
+        f"\n\nМатериал: архив проекта GitHub\nПроект: {link.github_owner}/{link.github_repo}"
         if link.content_type == "github_repository"
         else ""
     )
@@ -700,7 +919,7 @@ async def link_show(
             link.downloads_count if link.content_type == "github_repository" else None,
         )
         + material,
-        reply_markup=link_actions(link.id, url(me.username, link.slug)),
+        reply_markup=link_actions(link.id, await delivery_url(session, link.slug)),
     )
 
 
@@ -715,12 +934,20 @@ async def list_sources(
         return
     sources = await SourceRepository(session).list_for_link(link.id)
     visits = VisitRepository(session)
-    lines = ["<b>Источники трафика</b>"]
+    lines = [
+        (
+            "<b>Отдельные ссылки для разных мест</b>\n"
+            "Создайте отдельную ссылку для рекламы, сайта или каждого "
+            "партнёра — так вы поймёте, откуда приходят люди."
+        )
+    ]
     buttons = []
     for source in sources:
         summary = await visits.source_summary(source.id)
         status = "" if source.is_active else " (отключён)"
-        lines.append(f"\n{source.name}{status}\nПереходов: {summary['total_visits']}")
+        lines.append(
+            f"\n{escape(source.name)}{status}\nПереходов: {summary['total_visits']}"
+        )
         buttons.append(
             [
                 callback_button(
@@ -737,25 +964,46 @@ async def list_sources(
             )
         ]
     )
-    await callback.message.answer("\n".join(lines), reply_markup=buttons)
+    await callback.message.answer(
+        "\n".join(lines), reply_markup=inline_keyboard(buttons)
+    )
 
 
 @router.callback_query(SourceCallback.filter(F.action == "add"))
 async def add_source_start(
-    callback: CallbackQuery, callback_data: SourceCallback, state: FSMContext
+    callback: CallbackQuery,
+    callback_data: SourceCallback,
+    state: FSMContext,
+    session: AsyncSession,
 ) -> None:
     await callback.answer()
+    link = await LinkRepository(session).get(callback_data.link_id, active_only=True)
+    if not link:
+        await callback.message.answer(
+            "Эта ссылка уже отключена или принадлежит другому кабинету."
+        )
+        return
+    if await SourceRepository(session).count_for_link(link.id) >= MAX_SOURCES_PER_LINK:
+        await callback.message.answer(
+            f"Для одной ссылки можно создать не больше {MAX_SOURCES_PER_LINK} источников. Переименуйте или используйте один из уже созданных."
+        )
+        return
     await state.set_state(SourceFlow.name)
     await state.update_data(source_link_id=callback_data.link_id, source_mode="add")
-    await callback.message.answer("Введите название источника, например Instagram.")
+    await callback.message.answer(
+        "Напишите, где вы разместите эту отдельную ссылку. Например: «Telegram Ads», «Блогер Анна» или «Сайт»."
+    )
 
 
 @router.message(SourceFlow.name)
 async def add_source_name(
-    message: Message, state: FSMContext, session: AsyncSession, bot: Bot
+    message: Message, state: FSMContext, session: AsyncSession
 ) -> None:
-    if not message.text or len(message.text) > 128:
-        await message.answer("Введите название источника до 128 символов.")
+    name = (message.text or "").strip()
+    if not name or len(name) > 128:
+        await message.answer(
+            "Напишите непустое название длиной до 128 символов. Например: «Реклама в Telegram»."
+        )
         return
     source_data = await state.get_data()
     if source_data.get("source_mode") == "rename":
@@ -764,7 +1012,7 @@ async def add_source_name(
             await state.clear()
             await message.answer("Источник больше не существует.")
             return
-        source.name = message.text
+        source.name = name
         await state.clear()
         await message.answer("Название источника изменено. Ссылка осталась прежней.")
         return
@@ -774,12 +1022,13 @@ async def add_source_name(
         await state.clear()
         await message.answer("Эта ссылка больше не существует.")
         return
-    source = await TrafficSourceService(session).create(link.id, message.text)
-    me = await bot.get_me()
-    target = url(me.username, source.token)
+    source = await TrafficSourceService(session).create(link.id, name)
+    target = await delivery_url(session, source.token)
     await state.clear()
     await message.answer(
-        f"Источник создан.\n\nНазвание: {source.name}\nСсылка:\n<code>{target}</code>",
+        f"✅ Отдельная ссылка создана.\n\nИсточник: {escape(source.name)}\n"
+        f"Ссылка:\n<code>{target}</code>\n\n"
+        "Используйте её только в этом источнике, чтобы видеть отдельную статистику.",
         reply_markup=source_actions(source.id, link.id, target),
     )
 
@@ -789,7 +1038,6 @@ async def show_source(
     callback: CallbackQuery,
     callback_data: SourceCallback,
     session: AsyncSession,
-    bot: Bot,
 ) -> None:
     await callback.answer()
     source = await SourceRepository(session).get(callback_data.source_id)
@@ -797,11 +1045,10 @@ async def show_source(
         await callback.message.answer("Источник больше не существует.")
         return
     summary = await VisitRepository(session).source_summary(source.id)
-    me = await bot.get_me()
     await callback.message.answer(
         stats_text(source.name, summary),
         reply_markup=source_actions(
-            source.id, source.smart_link_id, url(me.username, source.token)
+            source.id, source.smart_link_id, await delivery_url(session, source.token)
         ),
     )
 
@@ -824,12 +1071,23 @@ async def source_stats(
 
 @router.callback_query(SourceCallback.filter(F.action == "rename"))
 async def rename_source_start(
-    callback: CallbackQuery, callback_data: SourceCallback, state: FSMContext
+    callback: CallbackQuery,
+    callback_data: SourceCallback,
+    state: FSMContext,
+    session: AsyncSession,
 ) -> None:
     await callback.answer()
+    source = await SourceRepository(session).get(callback_data.source_id)
+    if not source:
+        await callback.message.answer(
+            "Этот источник уже удалён или принадлежит другому кабинету."
+        )
+        return
     await state.set_state(SourceFlow.name)
     await state.update_data(source_mode="rename", source_id=callback_data.source_id)
-    await callback.message.answer("Введите новое название источника.")
+    await callback.message.answer(
+        "Напишите новое понятное название источника. Сама ссылка при этом не изменится."
+    )
 
 
 @router.callback_query(SourceCallback.filter(F.action == "disable"))
@@ -843,7 +1101,7 @@ async def disable_source(
         return
     source.is_active = False
     await callback.message.answer(
-        "Источник отключён. Историческая статистика сохранена."
+        "Источник отключён: его ссылка больше не работает. Собранная статистика сохранена."
     )
 
 
@@ -857,13 +1115,18 @@ async def link_delete_ask(
         await callback.message.answer("Эта ссылка больше не существует.")
         return
     await callback.message.answer(
-        f"Удалить умную ссылку «{link.name}»?", reply_markup=confirm("delete", link.id)
+        f"Отключить ссылку «{escape(link.name)}»? Люди больше не смогут получить по ней материал, но статистика сохранится.",
+        reply_markup=confirm("delete", link.id),
     )
 
 
 @router.callback_query(LinkCallback.filter(F.action == "delete"))
 async def link_delete(
-    callback: CallbackQuery, callback_data: LinkCallback, session: AsyncSession
+    callback: CallbackQuery,
+    callback_data: LinkCallback,
+    session: AsyncSession,
+    storage: FileStorageService,
+    commit_cleanups: list,
 ) -> None:
     await callback.answer()
     link = await LinkRepository(session).get(callback_data.link_id)
@@ -871,8 +1134,15 @@ async def link_delete(
         await callback.message.answer("Эта ссылка больше не существует.")
         return
     await LinkRepository(session).deactivate(link)
+    stored_paths = [link.relative_path] + [
+        file.relative_path
+        for file in await FallbackFileRepository(session).list_for_link(link.id)
+    ]
+    for path in stored_paths:
+        if path:
+            commit_cleanups.append(lambda path=path: storage.delete(path))
     await callback.message.answer(
-        "Ссылка отключена. Историческая статистика сохранена."
+        "Ссылка отключена: материал по ней больше не выдаётся. Собранная статистика сохранена."
     )
 
 
@@ -915,14 +1185,43 @@ async def stats_show(
 
 
 @router.callback_query(StatsCallback.filter(F.action == "links"))
-async def stats_links(callback: CallbackQuery, session: AsyncSession) -> None:
+async def stats_links(
+    callback: CallbackQuery,
+    callback_data: StatsCallback,
+    session: AsyncSession,
+) -> None:
     await callback.answer()
-    items, _ = await LinkRepository(session).page(0)
-    kb = [
-        [callback_button(x.name, StatsCallback(action="one", link_id=x.id).pack())]
-        for x in items
+    page = max(callback_data.page, 0)
+    items, total = await LinkRepository(session).page(page)
+    buttons = [
+        [
+            callback_button(
+                link.name, StatsCallback(action="one", link_id=link.id).pack()
+            )
+        ]
+        for link in items
     ]
-    await callback.message.answer("Выберите умную ссылку:", reply_markup=kb)
+    navigation = []
+    if page > 0:
+        navigation.append(
+            callback_button(
+                "← Назад", StatsCallback(action="links", page=page - 1).pack()
+            )
+        )
+    if (page + 1) * 8 < total:
+        navigation.append(
+            callback_button(
+                "Вперёд →", StatsCallback(action="links", page=page + 1).pack()
+            )
+        )
+    if navigation:
+        buttons.append(navigation)
+    text = (
+        "Выберите ссылку, статистику которой хотите посмотреть:"
+        if items
+        else "У вас пока нет активных ссылок. Создайте первую с помощью команды /add."
+    )
+    await callback.message.answer(text, reply_markup=inline_keyboard(buttons))
 
 
 @router.callback_query(StatsCallback.filter(F.action == "report"))
@@ -959,32 +1258,116 @@ async def stats_report(
     )
     try:
         await callback.message.answer_document(
-            FSInputFile(path), caption="HTML-отчёт со статистикой"
+            FSInputFile(path),
+            caption="Отчёт со статистикой. Скачайте файл и откройте его в браузере.",
         )
     finally:
         path.unlink(missing_ok=True)
 
 
 @router.message(Command("post"))
-async def post(message: Message, state: FSMContext) -> None:
+async def post(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    delivery_manager: DeliveryBotManager,
+) -> None:
+    if await DeliveryBotRepository(session).get() is None:
+        await message.answer(
+            "Сначала подключите бота для подписчиков с помощью команды /bot."
+        )
+        return
+    if delivery_manager.get_bot(message.from_user.id) is None:
+        await message.answer(
+            "Бот для подписчиков сейчас не запущен. Подключите его заново через /bot."
+        )
+        return
+    if not await ChannelRepository(session).get():
+        await message.answer(
+            "Сначала подключите канал через /channel. После этого вернитесь к команде /post."
+        )
+        return
+    await state.update_data(content_items=[], buttons=[])
     await state.set_state(PostFlow.content)
     await message.answer(
-        "<b>Создадим пост для канала.</b>\n\nПришлите сюда текст, фото, видео, документ или GIF. "
-        "Сначала вы увидите предпросмотр, и только потом сможете опубликовать пост."
+        "<b>Создадим пост для канала.</b>\n\nПришлите готовый пост: текст, фото, видео, документ или GIF. Можно отправить несколько сообщений в нужном порядке. Когда закончите, нажмите «Готово — добавить кнопки»."
     )
 
 
 @router.message(PostFlow.content)
-async def post_content(message: Message, state: FSMContext) -> None:
+async def post_content(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    storage: FileStorageService,
+    rollback_cleanups: list,
+) -> None:
     item = content(message)
     if not item:
-        await message.answer("Поддерживаются текст, фото, видео, документ и animation.")
+        await message.answer(
+            "Я не могу использовать сообщение такого типа. Пришлите текст, фото, видео, документ или GIF."
+        )
         return
-    await state.update_data(content=item, buttons=[])
-    await state.set_state(PostFlow.button_choice)
+    if item["content_type"] != "text":
+        if file_is_too_large(item):
+            limit_mb = settings.max_telegram_file_size // (1024 * 1024)
+            await message.answer(
+                f"Этот файл слишком большой. Пришлите файл размером не больше {limit_mb} МБ."
+            )
+            return
+        try:
+            stored = await storage.save_telegram_file(
+                bot,
+                item["file_id"] or "",
+                "posts/pending",
+                item["original_filename"] or "post-file",
+                item.get("mime_type"),
+            )
+        except (TelegramAPIError, OSError, ValueError):
+            await message.answer(
+                "Не удалось сохранить файл. Попробуйте отправить его ещё раз."
+            )
+            return
+        item.update(
+            file_id=None,
+            relative_path=stored.relative_path,
+            original_filename=stored.original_filename,
+            mime_type=stored.mime_type,
+            file_size=stored.file_size,
+        )
+        rollback_cleanups.append(lambda: storage.delete(stored.relative_path))
+    data = await state.get_data()
+    items = data.get("content_items", [])
+    items.append(item)
+    await state.update_data(content_items=items)
     await message.answer(
-        "Хотите добавить кнопку со ссылкой под постом? Например, «Открыть сайт».\n"
-        "Если кнопка не нужна, выберите «Не добавлять кнопку».",
+        f"Добавлено сообщений: {len(items)}. Пришлите следующее или нажмите «Готово — добавить кнопки».",
+        reply_markup=inline_keyboard(
+            [
+                [
+                    callback_button(
+                        "Готово — добавить кнопки",
+                        PostCallback(action="content_done").pack(),
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    PostCallback.filter(F.action == "content_done"), PostFlow.content
+)
+async def finish_post_content(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if not (await state.get_data()).get("content_items"):
+        await callback.message.answer(
+            "Сначала пришлите хотя бы одно сообщение или файл."
+        )
+        return
+    await state.set_state(PostFlow.button_choice)
+    await callback.message.answer(
+        "Хотите добавить кнопку со ссылкой под постом? Если кнопки не нужны, выберите «Не добавлять кнопку».",
         reply_markup=post_choice(),
     )
 
@@ -995,6 +1378,12 @@ async def post_content(message: Message, state: FSMContext) -> None:
 @router.callback_query(PostCallback.filter(F.action == "button"), PostFlow.button_more)
 async def post_button(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
+    data = await state.get_data()
+    if len(data.get("buttons", [])) >= MAX_POST_BUTTONS:
+        await callback.message.answer(
+            "Достигнут технический предел Telegram: 100 кнопок. Нажмите «Посмотреть перед публикацией»."
+        )
+        return
     await state.set_state(PostFlow.button_text)
     await callback.message.answer(
         "Напишите короткий текст для кнопки. Например: «Перейти на сайт» или «Скачать»."
@@ -1003,10 +1392,13 @@ async def post_button(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(PostFlow.button_text)
 async def post_button_text(message: Message, state: FSMContext) -> None:
-    if not message.text or len(message.text) > 64:
-        await message.answer("Введите текст до 64 символов.")
+    button_text = (message.text or "").strip()
+    if not button_text or len(button_text) > 64:
+        await message.answer(
+            "Напишите непустой текст длиной до 64 символов. Например: «Открыть сайт»."
+        )
         return
-    await state.update_data(button_text=message.text)
+    await state.update_data(button_text=button_text)
     await state.set_state(PostFlow.button_url)
     await message.answer(
         "Теперь пришлите ссылку, куда должна вести кнопка. Она должна начинаться с https://"
@@ -1016,12 +1408,19 @@ async def post_button_text(message: Message, state: FSMContext) -> None:
 @router.message(PostFlow.button_url)
 async def post_button_url(message: Message, state: FSMContext) -> None:
     try:
-        TypeAdapter(HttpUrl).validate_python(message.text)
+        button_url = TypeAdapter(HttpUrl).validate_python(message.text)
     except ValidationError:
-        await message.answer("Некорректный URL.")
+        await message.answer(
+            "Эта ссылка не подходит. Пришлите полную ссылку, например: https://example.com"
+        )
+        return
+    if button_url.scheme != "https":
+        await message.answer(
+            "Для безопасности ссылка должна начинаться с https:// Пришлите другую ссылку."
+        )
         return
     data = await state.get_data()
-    buttons = data["buttons"] + [(data["button_text"], message.text)]
+    buttons = data["buttons"] + [(data["button_text"], str(button_url))]
     await state.update_data(buttons=buttons)
     await state.set_state(PostFlow.button_more)
     await message.answer(
@@ -1034,13 +1433,23 @@ async def post_button_url(message: Message, state: FSMContext) -> None:
     PostCallback.filter(F.action == "preview"), PostFlow.button_choice
 )
 @router.callback_query(PostCallback.filter(F.action == "preview"), PostFlow.button_more)
-async def preview_post(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+async def preview_post(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    storage: FileStorageService,
+) -> None:
     await callback.answer()
     data = await state.get_data()
     buttons = [[url_button(text, url)] for text, url in data["buttons"]]
     await callback.message.answer("Предпросмотр:")
     await send_link_content(
-        bot, callback.message.chat.id, type("C", (), data["content"])(), buttons
+        bot,
+        callback.message.chat.id,
+        type("C", (), {})(),
+        buttons,
+        storage,
+        content_items=[type("C", (), item)() for item in data.get("content_items", [])],
     )
     await state.set_state(PostFlow.preview)
     await callback.message.answer(
@@ -1052,7 +1461,11 @@ async def preview_post(callback: CallbackQuery, state: FSMContext, bot: Bot) -> 
 
 @router.callback_query(PostCallback.filter(F.action == "publish"), PostFlow.preview)
 async def publish(
-    callback: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    delivery_manager: DeliveryBotManager,
+    storage: FileStorageService,
 ) -> None:
     await callback.answer()
     channel = await ChannelRepository(session).get()
@@ -1061,60 +1474,51 @@ async def publish(
             "Сначала нужно подключить канал. Отправьте /channel, выберите канал, а затем создайте пост заново."
         )
         return
+    delivery_bot = delivery_manager.get_bot(callback.from_user.id)
+    if delivery_bot is None:
+        await callback.message.answer(
+            "Бот для подписчиков сейчас не запущен. Подключите его заново через /bot."
+        )
+        return
     data = await state.get_data()
     buttons = [[url_button(text, url)] for text, url in data["buttons"]]
     try:
         await send_link_content(
-            bot, channel.channel_id, type("C", (), data["content"])(), buttons
+            delivery_bot,
+            channel.channel_id,
+            type("C", (), {})(),
+            buttons,
+            storage,
+            content_items=[
+                type("C", (), item)() for item in data.get("content_items", [])
+            ],
         )
     except TelegramAPIError:
         await callback.message.answer(
             "Не удалось опубликовать пост. Проверьте права бота."
         )
         return
+    await cleanup_post_draft(state, storage)
     await state.clear()
     await callback.message.answer("✅ Готово! Пост опубликован в подключённом канале.")
 
 
 @router.callback_query(PostCallback.filter(F.action == "restart"), PostFlow.preview)
-async def post_restart(callback: CallbackQuery, state: FSMContext) -> None:
+async def post_restart(
+    callback: CallbackQuery, state: FSMContext, storage: FileStorageService
+) -> None:
     await callback.answer()
+    await cleanup_post_draft(state, storage)
+    await state.clear()
     await state.set_state(PostFlow.content)
     await callback.message.answer("Отправьте новое содержимое публикации.")
 
 
-@router.message(Command("cancel"))
-async def cancel(
-    message: Message, state: FSMContext, storage: FileStorageService
-) -> None:
-    current_state = await state.get_state()
-    if current_state:
-        smart_link_states = {
-            SmartLinkFlow.name.state,
-            SmartLinkFlow.message.state,
-            SmartLinkFlow.material_type.state,
-            SmartLinkFlow.content.state,
-            SmartLinkFlow.github_url.state,
-            SmartLinkFlow.github_fallbacks.state,
-            SmartLinkFlow.preview.state,
-        }
-        if current_state in smart_link_states:
-            await cleanup_link_draft(state, storage)
-        await state.clear()
-        if current_state == ChannelFlow.value.state:
-            await message.answer(
-                "Действие отменено.", reply_markup=ReplyKeyboardRemove()
-            )
-            return
-        await message.answer("Действие отменено.")
-    else:
-        await message.answer(
-            "Сейчас нечего отменять. Начните с /channel, чтобы подключить канал, или с /add, чтобы создать ссылку."
-        )
-
-
 @router.callback_query(PostCallback.filter(F.action == "cancel"))
-async def post_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+async def post_cancel(
+    callback: CallbackQuery, state: FSMContext, storage: FileStorageService
+) -> None:
     await callback.answer()
+    await cleanup_post_draft(state, storage)
     await state.clear()
     await callback.message.answer("Действие отменено.")

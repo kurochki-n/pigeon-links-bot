@@ -13,7 +13,7 @@ class WorkspaceMiddleware(BaseMiddleware):
         event: Any,
         data: dict[str, Any],
     ) -> Any:
-        user = getattr(event, "from_user", None)
+        user = data.get("event_from_user") or getattr(event, "from_user", None)
         token = workspace_owner_id.set(user.id if user else None)
         try:
             return await handler(event, data)

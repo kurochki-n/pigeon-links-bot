@@ -40,6 +40,8 @@ class GithubService:
     """GitHub API access using only normalized owner/repository identifiers."""
 
     def __init__(self, max_archive_size: int) -> None:
+        if max_archive_size <= 0:
+            raise ValueError("max_archive_size must be positive")
         self.max_archive_size = max_archive_size
 
     @staticmethod
@@ -92,7 +94,13 @@ class GithubService:
         if response.is_error:
             return RepositoryValidation("unavailable")
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            log.warning("GitHub API returned invalid JSON")
+            return RepositoryValidation("unavailable")
+        if not isinstance(data, dict):
+            return RepositoryValidation("unavailable")
         if data.get("private"):
             return RepositoryValidation("private")
         return RepositoryValidation(
@@ -100,7 +108,7 @@ class GithubService:
             GithubRepository(
                 owner=repository.owner,
                 repo=repository.repo,
-                url=data.get("html_url") or repository.url,
+                url=repository.url,
                 full_name=data.get("full_name") or repository.full_name,
                 description=data.get("description"),
             ),

@@ -1,7 +1,7 @@
 import logging
 import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from html import escape
 
 from aiogram import Bot
 from aiogram.enums import ChatMemberStatus, ChatType
@@ -11,15 +11,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.database.repositories.repositories import (
     ChannelRepository,
+    ContentItemRepository,
     FallbackFileRepository,
-    InviteRepository,
     LinkRepository,
+    ResourceRepository,
     SourceRepository,
     VisitRepository,
 )
+from bot.keyboards.callbacks import ResourceCallback
 from bot.keyboards.keyboards import github_download_keyboard
 from bot.services.storage_service import FileStorageService
-from bot.utils.rich_messages import RichButtons, rich_message
+from bot.utils.rich_messages import (
+    ButtonRows,
+    callback_button,
+    inline_keyboard,
+    url_button,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +66,11 @@ class ChannelSetupService:
             invite_url = None
             if not chat.username:
                 existing_invite = getattr(chat, "invite_link", None)
-                invite_url = getattr(existing_invite, "invite_link", None)
+                invite_url = (
+                    existing_invite
+                    if isinstance(existing_invite, str)
+                    else getattr(existing_invite, "invite_link", None)
+                )
                 if not invite_url:
                     invite_url = (
                         await self.bot.create_chat_invite_link(
@@ -114,25 +125,54 @@ async def send_link_content(
     bot: Bot,
     chat_id: int,
     link: object,
-    buttons: RichButtons | None = None,
+    buttons: ButtonRows | None = None,
     storage: FileStorageService | None = None,
+    content_items: list[object] | None = None,
+    resources: list[object] | None = None,
 ) -> None:
+    if content_items is not None:
+        resource_buttons: ButtonRows = []
+        for resource in resources or []:
+            if resource.resource_type == "github":
+                resource_buttons.append(
+                    [
+                        callback_button(
+                            resource.title,
+                            ResourceCallback(resource_id=resource.id).pack(),
+                        )
+                    ]
+                )
+            else:
+                resource_buttons.append([url_button(resource.title, resource.url)])
+        last_item_buttons = (buttons or []) + resource_buttons
+        for position, item in enumerate(content_items):
+            await send_link_content(
+                bot,
+                chat_id,
+                item,
+                buttons=last_item_buttons
+                if position == len(content_items) - 1
+                else None,
+                storage=storage,
+            )
+        return
     kind, text, caption, file_id = (
         getattr(link, x) for x in ("content_type", "text", "caption", "file_id")
     )
     message_text = getattr(link, "message_text", None)
     if kind == "github_repository":
-        await bot.send_rich_message(
-            chat_id, rich_message(message_text or "", github_download_keyboard(link.id))
+        await bot.send_message(
+            chat_id,
+            message_text or "",
+            reply_markup=github_download_keyboard(link.id),
         )
         return
     if kind == "none":
-        if buttons:
-            await bot.send_rich_message(
-                chat_id, rich_message(message_text or "", buttons)
-            )
-        else:
-            await bot.send_message(chat_id, message_text or "")
+        await bot.send_message(
+            chat_id,
+            message_text or "",
+            reply_markup=inline_keyboard(buttons) if buttons else None,
+        )
         return
     if message_text:
         await bot.send_message(chat_id, message_text)
@@ -147,22 +187,26 @@ async def send_link_content(
         if storage and local_path
         else None
     )
+    markup = inline_keyboard(buttons) if buttons else None
     if kind == "text":
-        if buttons:
-            await bot.send_rich_message(chat_id, rich_message(text or "", buttons))
-        else:
-            await bot.send_message(chat_id, text or "")
+        await bot.send_message(chat_id, text or "", reply_markup=markup)
         return
     if kind == "photo":
-        await bot.send_photo(chat_id, local_file or file_id or "", caption=caption)
+        await bot.send_photo(
+            chat_id, local_file or file_id or "", caption=caption, reply_markup=markup
+        )
     elif kind == "video":
-        await bot.send_video(chat_id, local_file or file_id or "", caption=caption)
+        await bot.send_video(
+            chat_id, local_file or file_id or "", caption=caption, reply_markup=markup
+        )
     elif kind == "document":
-        await bot.send_document(chat_id, local_file or file_id or "", caption=caption)
+        await bot.send_document(
+            chat_id, local_file or file_id or "", caption=caption, reply_markup=markup
+        )
     elif kind == "animation":
-        await bot.send_animation(chat_id, local_file or file_id or "", caption=caption)
-    if buttons:
-        await bot.send_rich_message(chat_id, rich_message("", buttons))
+        await bot.send_animation(
+            chat_id, local_file or file_id or "", caption=caption, reply_markup=markup
+        )
 
 
 async def send_stored_file(
@@ -198,6 +242,8 @@ class LinkService:
         content: dict[str, str | None],
         created_by: int,
         fallback_files: list[dict[str, str | None]] | None = None,
+        content_items: list[dict[str, object]] | None = None,
+        resources: list[dict[str, object]] | None = None,
     ) -> object:
         for _ in range(8):
             candidate = slug()
@@ -212,6 +258,14 @@ class LinkService:
                 if fallback_files:
                     await FallbackFileRepository(self.links.session).replace(
                         link.id, fallback_files
+                    )
+                if content_items is not None:
+                    await ContentItemRepository(self.links.session).replace(
+                        link.id, content_items
+                    )
+                if resources is not None:
+                    await ResourceRepository(self.links.session).replace(
+                        link.id, resources
                     )
                 return link
         raise RuntimeError("Could not generate unique smart-link slug")
@@ -232,26 +286,22 @@ class TrafficSourceService:
         raise RuntimeError("Could not generate unique traffic-source token")
 
 
-class AdminInviteService:
-    def __init__(self, session: AsyncSession):
-        self.repo = InviteRepository(session)
-
-    async def create(self, creator: int) -> str:
-        token = secrets.token_urlsafe(24)
-        await self.repo.create(token, creator, datetime.now(UTC) + timedelta(hours=24))
-        return token
-
-
 def stats_text(
     name: str, data: dict[str, int], downloads_count: int | None = None
 ) -> str:
     initial = data["not_subscribed_initially"]
     conversion = data["subscribed_after_redirect"] / initial * 100 if initial else 0
     downloads = (
-        f"\nСкачиваний ZIP: {downloads_count}" if downloads_count is not None else ""
+        f"\nПолучений ZIP-архива: {downloads_count}"
+        if downloads_count is not None
+        else ""
     )
     return (
-        f"<b>{name}</b>\n\nВсего переходов: {data['total_visits']}\nУникальных пользователей: {data['unique_users']}\n\n"
-        f"Уже были подписаны: {data['already_subscribed']}\nНе были подписаны: {initial}\n"
-        f"Подписались после перехода: {data['subscribed_after_redirect']}\n\nКонверсия в подписку: {conversion:.2f}%{downloads}"
+        f"<b>{escape(name)}</b>\n\n"
+        f"Открытий ссылки: {data['total_visits']}\n"
+        f"Разных людей: {data['unique_users']}\n\n"
+        f"Уже были подписаны: {data['already_subscribed']}\n"
+        f"Не были подписаны: {initial}\n"
+        f"Подписались после перехода: {data['subscribed_after_redirect']}\n\n"
+        f"Доля подписавшихся: {conversion:.2f}%{downloads}"
     )

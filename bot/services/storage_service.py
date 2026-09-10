@@ -22,8 +22,11 @@ class StoredFile:
 class FileStorageService:
     """Safe permanent filesystem storage; the database stores only relative paths."""
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, max_file_size: int) -> None:
+        if max_file_size <= 0:
+            raise ValueError("max_file_size must be positive")
         self.root = Path(root).resolve()
+        self.max_file_size = max_file_size
 
     async def ensure_root(self) -> None:
         await asyncio.to_thread(self.root.mkdir, parents=True, exist_ok=True)
@@ -61,6 +64,8 @@ class FileStorageService:
         try:
             await bot.download(file_id, destination=destination)
             size = (await asyncio.to_thread(destination.stat)).st_size
+            if size > self.max_file_size:
+                raise ValueError("Telegram file exceeds the configured size limit")
             return StoredFile(
                 relative_path=relative_path.as_posix(),
                 original_filename=Path(original_filename).name or "file",

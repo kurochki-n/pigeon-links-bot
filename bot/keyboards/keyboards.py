@@ -1,11 +1,11 @@
 from aiogram.types import (
+    ChatAdministratorRights,
     KeyboardButton,
     KeyboardButtonRequestChat,
     ReplyKeyboardMarkup,
 )
 
 from bot.keyboards.callbacks import (
-    AdminCallback,
     ChannelCallback,
     LinkCallback,
     MaterialCallback,
@@ -14,16 +14,25 @@ from bot.keyboards.callbacks import (
     StatsCallback,
     SubscriptionCallback,
 )
-from bot.utils.rich_messages import RichButtons, callback_button, url_button
+from bot.utils.rich_messages import ButtonRows, as_markup, callback_button, url_button
 
 CHANNEL_REQUEST_ID = 1001
 
-
-def admin_menu() -> RichButtons:
-    return [
-        [callback_button("Пригласить помощника", AdminCallback(action="add").pack())],
-        [callback_button("Убрать помощника", AdminCallback(action="remove").pack())],
-    ]
+_CHANNEL_RIGHTS = ChatAdministratorRights(
+    is_anonymous=False,
+    can_manage_chat=True,
+    can_delete_messages=False,
+    can_manage_video_chats=False,
+    can_restrict_members=False,
+    can_promote_members=False,
+    can_change_info=False,
+    can_invite_users=False,
+    can_post_stories=False,
+    can_edit_stories=False,
+    can_delete_stories=False,
+    can_send_welcome_messages=False,
+    can_post_messages=True,
+)
 
 
 def channel_selector() -> ReplyKeyboardMarkup:
@@ -37,6 +46,8 @@ def channel_selector() -> ReplyKeyboardMarkup:
                         request_id=CHANNEL_REQUEST_ID,
                         chat_is_channel=True,
                         bot_is_member=True,
+                        user_administrator_rights=_CHANNEL_RIGHTS,
+                        bot_administrator_rights=_CHANNEL_RIGHTS,
                         request_title=True,
                         request_username=True,
                     ),
@@ -49,7 +60,8 @@ def channel_selector() -> ReplyKeyboardMarkup:
     )
 
 
-def channel_menu(configured: bool) -> RichButtons:
+@as_markup
+def channel_menu(configured: bool) -> ButtonRows:
     rows = [
         [
             callback_button(
@@ -69,22 +81,25 @@ def channel_menu(configured: bool) -> RichButtons:
     return rows
 
 
-def confirm(action: str, link_id: int = 0) -> RichButtons:
+@as_markup
+def confirm(action: str, link_id: int = 0) -> ButtonRows:
     return [
         [
             callback_button(
-                "Да, удалить", LinkCallback(action=action, link_id=link_id).pack()
+                "Да, отключить", LinkCallback(action=action, link_id=link_id).pack()
             ),
             callback_button("Отмена", LinkCallback(action="cancel").pack()),
         ]
     ]
 
 
-def material_type_menu() -> RichButtons:
+@as_markup
+def material_type_menu() -> ButtonRows:
     return [
         [
             callback_button(
-                "Файл, фото или видео", MaterialCallback(action="telegram").pack()
+                "Текст, файл, фото или видео",
+                MaterialCallback(action="telegram").pack(),
             )
         ],
         [callback_button("Архив из GitHub", MaterialCallback(action="github").pack())],
@@ -97,7 +112,8 @@ def material_type_menu() -> RichButtons:
     ]
 
 
-def fallback_files_menu() -> RichButtons:
+@as_markup
+def fallback_files_menu() -> ButtonRows:
     return [
         [
             callback_button(
@@ -108,28 +124,31 @@ def fallback_files_menu() -> RichButtons:
     ]
 
 
-def github_download_keyboard(link_id: int) -> RichButtons:
+@as_markup
+def github_download_keyboard(link_id: int) -> ButtonRows:
     return [
         [
             callback_button(
-                "Скачать архив ZIP",
+                "Скачать ZIP-архив",
                 LinkCallback(action="download_github", link_id=link_id).pack(),
             )
         ]
     ]
 
 
-def github_preview_keyboard() -> RichButtons:
+@as_markup
+def github_preview_keyboard() -> ButtonRows:
     return [
         [
             callback_button(
-                "Скачать архив ZIP", LinkCallback(action="preview_github").pack()
+                "Скачать ZIP-архив", LinkCallback(action="preview_github").pack()
             )
         ]
     ]
 
 
-def link_preview() -> RichButtons:
+@as_markup
+def link_preview() -> ButtonRows:
     return [
         [
             callback_button(
@@ -143,9 +162,10 @@ def link_preview() -> RichButtons:
     ]
 
 
-def link_actions(link_id: int, url: str) -> RichButtons:
+@as_markup
+def link_actions(link_id: int, url: str) -> ButtonRows:
     return [
-        [url_button("Открыть ссылку для людей", url)],
+        [url_button("Перейти по ссылке", url)],
         [
             callback_button(
                 "Источники переходов",
@@ -165,7 +185,8 @@ def link_actions(link_id: int, url: str) -> RichButtons:
     ]
 
 
-def links_page(items: list[object], page: int) -> RichButtons:
+@as_markup
+def links_page(items: list[object], page: int, total: int) -> ButtonRows:
     rows = [
         [callback_button(x.name, LinkCallback(action="show", link_id=x.id).pack())]
         for x in items
@@ -175,7 +196,7 @@ def links_page(items: list[object], page: int) -> RichButtons:
         nav.append(
             callback_button("Назад", LinkCallback(action="page", page=page - 1).pack())
         )
-    if len(items) == 8:
+    if (page + 1) * 8 < total:
         nav.append(
             callback_button("Вперёд", LinkCallback(action="page", page=page + 1).pack())
         )
@@ -184,7 +205,8 @@ def links_page(items: list[object], page: int) -> RichButtons:
     return rows
 
 
-def source_actions(source_id: int, link_id: int, url: str) -> RichButtons:
+@as_markup
+def source_actions(source_id: int, link_id: int, url: str) -> ButtonRows:
     return [
         [url_button("Открыть ссылку источника", url)],
         [
@@ -195,21 +217,23 @@ def source_actions(source_id: int, link_id: int, url: str) -> RichButtons:
         ],
         [
             callback_button(
-                "Статистика", SourceCallback(action="stats", source_id=source_id).pack()
+                "Посмотреть статистику",
+                SourceCallback(action="stats", source_id=source_id).pack(),
             ),
             callback_button(
-                "Переименовать",
+                "Изменить название",
                 SourceCallback(action="rename", source_id=source_id).pack(),
             ),
             callback_button(
-                "Отключить",
+                "Отключить источник",
                 SourceCallback(action="disable", source_id=source_id).pack(),
             ),
         ],
     ]
 
 
-def subscribe_keyboard(url: str, link_id: int, source_id: int = 0) -> RichButtons:
+@as_markup
+def subscribe_keyboard(url: str, link_id: int, source_id: int = 0) -> ButtonRows:
     return [
         [url_button("1. Подписаться на канал", url)],
         [
@@ -221,7 +245,8 @@ def subscribe_keyboard(url: str, link_id: int, source_id: int = 0) -> RichButton
     ]
 
 
-def stats_menu() -> RichButtons:
+@as_markup
+def stats_menu() -> ButtonRows:
     return [
         [callback_button("Все ссылки вместе", StatsCallback(action="all").pack())],
         [
@@ -232,7 +257,8 @@ def stats_menu() -> RichButtons:
     ]
 
 
-def report_button(link_id: int = 0) -> RichButtons:
+@as_markup
+def report_button(link_id: int = 0) -> ButtonRows:
     return [
         [
             callback_button(
@@ -243,7 +269,8 @@ def report_button(link_id: int = 0) -> RichButtons:
     ]
 
 
-def post_choice() -> RichButtons:
+@as_markup
+def post_choice() -> ButtonRows:
     return [
         [
             callback_button(
@@ -255,7 +282,8 @@ def post_choice() -> RichButtons:
     ]
 
 
-def post_more() -> RichButtons:
+@as_markup
+def post_more() -> ButtonRows:
     return [
         [
             callback_button(
@@ -270,7 +298,8 @@ def post_more() -> RichButtons:
     ]
 
 
-def post_preview() -> RichButtons:
+@as_markup
+def post_preview() -> ButtonRows:
     return [
         [
             callback_button(

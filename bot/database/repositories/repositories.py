@@ -1,13 +1,17 @@
 from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from bot.database.models import (
-    AdminInvite,
+    ChannelConnectToken,
+    DeliveryBotSettings,
     SmartLink,
+    SmartLinkContentItem,
     SmartLinkFallbackFile,
+    SmartLinkResource,
     SmartLinkSource,
     SmartLinkSourceVisit,
     SmartLinkVisit,
@@ -22,8 +26,11 @@ def now() -> datetime:
     return datetime.now(UTC)
 
 
-def is_expired(value: datetime) -> bool:
-    return (value if value.tzinfo else value.replace(tzinfo=UTC)) <= now()
+def current_owner_id() -> int:
+    owner_id = workspace_owner_id.get()
+    if owner_id is None:
+        raise RuntimeError("User workspace is unavailable for this update")
+    return owner_id
 
 
 class LinkRepository:
@@ -40,8 +47,8 @@ class LinkRepository:
         self, link_id: int, active_only: bool = False, scoped: bool = True
     ) -> SmartLink | None:
         stmt = select(SmartLink).where(SmartLink.id == link_id)
-        if scoped and (owner_id := workspace_owner_id.get()) is not None:
-            stmt = stmt.where(SmartLink.created_by == owner_id)
+        if scoped:
+            stmt = stmt.where(SmartLink.created_by == current_owner_id())
         if active_only:
             stmt = stmt.where(SmartLink.is_active.is_(True))
         return await self.session.scalar(stmt)
@@ -52,9 +59,9 @@ class LinkRepository:
         )
 
     async def page(self, page: int, size: int = 8) -> tuple[list[SmartLink], int]:
-        condition = SmartLink.is_active.is_(True)
-        if (owner_id := workspace_owner_id.get()) is not None:
-            condition = condition & (SmartLink.created_by == owner_id)
+        condition = SmartLink.is_active.is_(True) & (
+            SmartLink.created_by == current_owner_id()
+        )
         total = (
             await self.session.scalar(
                 select(func.count()).select_from(SmartLink).where(condition)
@@ -77,14 +84,16 @@ class LinkRepository:
             (
                 await self.session.scalars(
                     select(SmartLink)
-                    .where(SmartLink.created_by == workspace_owner_id.get())
+                    .where(SmartLink.created_by == current_owner_id())
                     .order_by(SmartLink.created_at.desc())
                 )
             ).all()
         )
 
     async def downloads_total(self, link_id: int | None = None) -> int:
-        stmt = select(func.coalesce(func.sum(SmartLink.downloads_count), 0))
+        stmt = select(func.coalesce(func.sum(SmartLink.downloads_count), 0)).where(
+            SmartLink.created_by == current_owner_id()
+        )
         if link_id is not None:
             stmt = stmt.where(SmartLink.id == link_id)
         return int(await self.session.scalar(stmt) or 0)
@@ -120,8 +129,10 @@ class SourceRepository:
         self, source_id: int, active_only: bool = False, scoped: bool = True
     ) -> SmartLinkSource | None:
         stmt = select(SmartLinkSource).where(SmartLinkSource.id == source_id)
-        if scoped and (owner_id := workspace_owner_id.get()) is not None:
-            stmt = stmt.join(SmartLink).where(SmartLink.created_by == owner_id)
+        if scoped:
+            stmt = stmt.join(SmartLink).where(
+                SmartLink.created_by == current_owner_id()
+            )
         if active_only:
             stmt = stmt.where(SmartLinkSource.is_active.is_(True))
         return await self.session.scalar(stmt)
@@ -129,6 +140,16 @@ class SourceRepository:
     async def by_token(self, token: str) -> SmartLinkSource | None:
         return await self.session.scalar(
             select(SmartLinkSource).where(SmartLinkSource.token == token)
+        )
+
+    async def count_for_link(self, smart_link_id: int) -> int:
+        return int(
+            await self.session.scalar(
+                select(func.count())
+                .select_from(SmartLinkSource)
+                .where(SmartLinkSource.smart_link_id == smart_link_id)
+            )
+            or 0
         )
 
     async def list_for_link(self, smart_link_id: int) -> list[SmartLinkSource]:
@@ -140,6 +161,90 @@ class SourceRepository:
                     .order_by(SmartLinkSource.created_at)
                 )
             ).all()
+        )
+
+
+class ContentItemRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def replace(self, smart_link_id: int, items: list[dict[str, object]]) -> None:
+        await self.session.execute(
+            delete(SmartLinkContentItem).where(
+                SmartLinkContentItem.smart_link_id == smart_link_id
+            )
+        )
+        for position, item in enumerate(items):
+            self.session.add(
+                SmartLinkContentItem(
+                    smart_link_id=smart_link_id,
+                    content_type=str(item["content_type"]),
+                    text=item.get("text"),
+                    caption=item.get("caption"),
+                    file_id=item.get("file_id"),
+                    relative_path=item.get("relative_path"),
+                    original_filename=item.get("original_filename"),
+                    mime_type=item.get("mime_type"),
+                    file_size=item.get("file_size"),
+                    position=position,
+                    created_at=now(),
+                )
+            )
+        await self.session.flush()
+
+    async def list_for_link(self, smart_link_id: int) -> list[SmartLinkContentItem]:
+        return list(
+            (
+                await self.session.scalars(
+                    select(SmartLinkContentItem)
+                    .where(SmartLinkContentItem.smart_link_id == smart_link_id)
+                    .order_by(SmartLinkContentItem.position)
+                )
+            ).all()
+        )
+
+
+class ResourceRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def replace(self, smart_link_id: int, items: list[dict[str, object]]) -> None:
+        await self.session.execute(
+            delete(SmartLinkResource).where(
+                SmartLinkResource.smart_link_id == smart_link_id
+            )
+        )
+        for position, item in enumerate(items):
+            self.session.add(
+                SmartLinkResource(
+                    smart_link_id=smart_link_id,
+                    resource_type=str(item["resource_type"]),
+                    title=str(item["title"]),
+                    url=str(item["url"]),
+                    github_owner=item.get("github_owner"),
+                    github_repo=item.get("github_repo"),
+                    position=position,
+                    created_at=now(),
+                )
+            )
+        await self.session.flush()
+
+    async def list_for_link(self, smart_link_id: int) -> list[SmartLinkResource]:
+        return list(
+            (
+                await self.session.scalars(
+                    select(SmartLinkResource)
+                    .where(SmartLinkResource.smart_link_id == smart_link_id)
+                    .order_by(SmartLinkResource.position)
+                )
+            ).all()
+        )
+
+    async def get(self, resource_id: int) -> SmartLinkResource | None:
+        return await self.session.scalar(
+            select(SmartLinkResource)
+            .where(SmartLinkResource.id == resource_id)
+            .options(selectinload(SmartLinkResource.smart_link))
         )
 
 
@@ -232,9 +337,21 @@ class TelegramUserRepository:
             updated_at=updated_at,
             **fields,
         )
-        self.session.add(item)
-        await self.session.flush()
-        return item
+        try:
+            async with self.session.begin_nested():
+                self.session.add(item)
+                await self.session.flush()
+            return item
+        except IntegrityError:
+            item = await self.session.scalar(
+                select(TelegramUser).where(TelegramUser.telegram_id == telegram_id)
+            )
+            if item is None:
+                raise
+            for key, value in fields.items():
+                setattr(item, key, value)
+            item.updated_at = updated_at
+            return item
 
     async def by_telegram_ids(self, telegram_ids: set[int]) -> dict[int, TelegramUser]:
         if not telegram_ids:
@@ -301,9 +418,23 @@ class VisitRepository:
             last_visit_at=visited_at,
             visits_count=1,
         )
-        self.session.add(visit)
-        await self.session.flush()
-        return visit
+        try:
+            async with self.session.begin_nested():
+                self.session.add(visit)
+                await self.session.flush()
+            return visit
+        except IntegrityError:
+            existing = await self.session.scalar(
+                select(SmartLinkVisit).where(
+                    SmartLinkVisit.smart_link_id == link_id,
+                    SmartLinkVisit.telegram_user_id == user_id,
+                )
+            )
+            if existing is None:
+                raise
+            existing.visits_count += 1
+            existing.last_visit_at = visited_at
+            return existing
 
     async def touch_source(
         self, source_id: int, user_id: int, subscribed: bool
@@ -327,9 +458,23 @@ class VisitRepository:
             last_visit_at=now(),
             visits_count=1,
         )
-        self.session.add(visit)
-        await self.session.flush()
-        return visit
+        try:
+            async with self.session.begin_nested():
+                self.session.add(visit)
+                await self.session.flush()
+            return visit
+        except IntegrityError:
+            existing = await self.session.scalar(
+                select(SmartLinkSourceVisit).where(
+                    SmartLinkSourceVisit.source_id == source_id,
+                    SmartLinkSourceVisit.telegram_user_id == user_id,
+                )
+            )
+            if existing is None:
+                raise
+            existing.visits_count += 1
+            existing.last_visit_at = now()
+            return existing
 
     async def mark_subscribed(
         self, link_id: int, user_id: int, source_id: int | None = None
@@ -387,17 +532,47 @@ class VisitRepository:
             event.subscribed_at = now()
 
     async def summary(self, link_id: int | None = None) -> dict[str, int]:
-        stmt = select(SmartLinkVisit)
-        if link_id:
+        stmt = (
+            select(SmartLinkVisit)
+            .join(SmartLink)
+            .where(SmartLink.created_by == current_owner_id())
+        )
+        if link_id is not None:
             stmt = stmt.where(SmartLinkVisit.smart_link_id == link_id)
-        visits = (await self.session.scalars(stmt)).all()
-        initial_no = sum(not x.was_subscribed for x in visits)
+        visits = list((await self.session.scalars(stmt)).all())
+
+        if link_id is not None:
+            initial_no = sum(not visit.was_subscribed for visit in visits)
+            return {
+                "total_visits": sum(visit.visits_count for visit in visits),
+                "unique_users": len(visits),
+                "already_subscribed": sum(visit.was_subscribed for visit in visits),
+                "not_subscribed_initially": initial_no,
+                "subscribed_after_redirect": sum(
+                    visit.subscribed_after for visit in visits
+                ),
+            }
+
+        by_user: dict[int, list[SmartLinkVisit]] = {}
+        for visit in visits:
+            by_user.setdefault(visit.telegram_user_id, []).append(visit)
+        first_visits = [
+            min(user_visits, key=lambda visit: visit.first_visit_at)
+            for user_visits in by_user.values()
+        ]
+        initially_not_subscribed = [
+            visit for visit in first_visits if not visit.was_subscribed
+        ]
+        converted_users = sum(
+            any(visit.subscribed_after for visit in by_user[first.telegram_user_id])
+            for first in initially_not_subscribed
+        )
         return {
-            "total_visits": sum(x.visits_count for x in visits),
-            "unique_users": len(visits),
-            "already_subscribed": sum(x.was_subscribed for x in visits),
-            "not_subscribed_initially": initial_no,
-            "subscribed_after_redirect": sum(x.subscribed_after for x in visits),
+            "total_visits": sum(visit.visits_count for visit in visits),
+            "unique_users": len(by_user),
+            "already_subscribed": sum(visit.was_subscribed for visit in first_visits),
+            "not_subscribed_initially": len(initially_not_subscribed),
+            "subscribed_after_redirect": converted_users,
         }
 
     async def source_summary(self, source_id: int) -> dict[str, int]:
@@ -424,7 +599,11 @@ class VisitRepository:
             (
                 await self.session.scalars(
                     select(SmartLinkVisit)
-                    .where(SmartLinkVisit.smart_link_id == link_id)
+                    .join(SmartLink)
+                    .where(
+                        SmartLinkVisit.smart_link_id == link_id,
+                        SmartLink.created_by == current_owner_id(),
+                    )
                     .order_by(SmartLinkVisit.last_visit_at.desc())
                 )
             ).all()
@@ -435,7 +614,11 @@ class VisitRepository:
             (
                 await self.session.scalars(
                     select(SmartLinkVisitEvent)
-                    .where(SmartLinkVisitEvent.smart_link_id == link_id)
+                    .join(SmartLink)
+                    .where(
+                        SmartLinkVisitEvent.smart_link_id == link_id,
+                        SmartLink.created_by == current_owner_id(),
+                    )
                     .options(
                         selectinload(SmartLinkVisitEvent.user),
                         selectinload(SmartLinkVisitEvent.source),
@@ -446,19 +629,113 @@ class VisitRepository:
         )
 
 
+class DeliveryBotRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get(self, owner_id: int | None = None) -> DeliveryBotSettings | None:
+        resolved_owner_id = owner_id if owner_id is not None else current_owner_id()
+        return await self.session.get(DeliveryBotSettings, resolved_owner_id)
+
+    async def by_bot_id(self, bot_id: int) -> DeliveryBotSettings | None:
+        return await self.session.scalar(
+            select(DeliveryBotSettings).where(DeliveryBotSettings.bot_id == bot_id)
+        )
+
+    async def all(self) -> list[DeliveryBotSettings]:
+        return list((await self.session.scalars(select(DeliveryBotSettings))).all())
+
+    async def save(
+        self, bot_id: int, username: str, encrypted_token: str
+    ) -> DeliveryBotSettings:
+        owner_id = current_owner_id()
+        item = await self.get(owner_id)
+        if item is None:
+            item = DeliveryBotSettings(
+                owner_id=owner_id,
+                bot_id=bot_id,
+                username=username,
+                encrypted_token=encrypted_token,
+                created_at=now(),
+                updated_at=now(),
+            )
+            self.session.add(item)
+        else:
+            item.bot_id = bot_id
+            item.username = username
+            item.encrypted_token = encrypted_token
+            item.updated_at = now()
+        await self.session.flush()
+        return item
+
+    async def delete(self) -> None:
+        item = await self.get()
+        if item:
+            await self.session.delete(item)
+
+
+class ChannelConnectTokenRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def create(
+        self, token_hash: str, owner_id: int, expires_at: datetime
+    ) -> ChannelConnectToken:
+        await self.session.execute(
+            delete(ChannelConnectToken).where(
+                (ChannelConnectToken.owner_id == owner_id)
+                | (ChannelConnectToken.expires_at <= now())
+            )
+        )
+        item = ChannelConnectToken(
+            token_hash=token_hash,
+            owner_id=owner_id,
+            expires_at=expires_at,
+        )
+        self.session.add(item)
+        await self.session.flush()
+        return item
+
+    async def get_valid(self, token_hash: str) -> ChannelConnectToken | None:
+        item = await self.session.scalar(
+            select(ChannelConnectToken).where(
+                ChannelConnectToken.token_hash == token_hash,
+                ChannelConnectToken.used_at.is_(None),
+            )
+        )
+        if item is None:
+            return None
+        expires_at = (
+            item.expires_at
+            if item.expires_at.tzinfo
+            else item.expires_at.replace(tzinfo=UTC)
+        )
+        return item if expires_at > now() else None
+
+    async def consume(self, item: ChannelConnectToken) -> None:
+        item.used_at = now()
+
+
 class ChannelRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get(self, owner_id: int | None = None) -> UserChannelSettings | None:
-        return await self.session.get(
-            UserChannelSettings, owner_id or workspace_owner_id.get()
+    async def by_channel_id(self, channel_id: int) -> UserChannelSettings | None:
+        return await self.session.scalar(
+            select(UserChannelSettings).where(
+                UserChannelSettings.channel_id == channel_id
+            )
         )
 
-    async def save(self, **data: object) -> UserChannelSettings:
-        owner_id = workspace_owner_id.get()
-        if owner_id is None:
-            raise RuntimeError("Workspace owner is required")
+    async def get(self, owner_id: int | None = None) -> UserChannelSettings | None:
+        resolved_owner_id = owner_id if owner_id is not None else current_owner_id()
+        return await self.session.get(UserChannelSettings, resolved_owner_id)
+
+    async def save_for_owner(
+        self, owner_id: int, **data: object
+    ) -> UserChannelSettings:
+        if owner_id <= 0:
+            raise ValueError("owner_id must be positive")
         item = await self.get(owner_id)
         if item is None:
             item = UserChannelSettings(
@@ -472,32 +749,10 @@ class ChannelRepository:
         await self.session.flush()
         return item
 
+    async def save(self, **data: object) -> UserChannelSettings:
+        return await self.save_for_owner(current_owner_id(), **data)
+
     async def delete(self) -> None:
         item = await self.get()
         if item:
             await self.session.delete(item)
-
-
-class InviteRepository:
-    def __init__(self, session: AsyncSession):
-        self.session = session
-
-    async def create(
-        self, token: str, creator: int, expires_at: datetime
-    ) -> AdminInvite:
-        obj = AdminInvite(
-            token=token, created_by=creator, created_at=now(), expires_at=expires_at
-        )
-        self.session.add(obj)
-        await self.session.flush()
-        return obj
-
-    async def consume(self, token: str, user_id: int) -> bool:
-        item = await self.session.scalar(
-            select(AdminInvite).where(AdminInvite.token == token)
-        )
-        if not item or item.used_at or is_expired(item.expires_at):
-            return False
-        item.used_at = now()
-        item.used_by = user_id
-        return True

@@ -6,12 +6,17 @@ class SmartLinkFlow(StatesGroup):
     message = State()
     material_type = State()
     content = State()
+    resources = State()
     github_url = State()
     github_fallbacks = State()
     preview = State()
 
 
-class ChannelFlow(StatesGroup):
+class DeliveryBotFlow(StatesGroup):
+    token = State()
+
+
+class DeliveryChannelFlow(StatesGroup):
     value = State()
 
 

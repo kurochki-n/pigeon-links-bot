@@ -1,8 +1,10 @@
 from bot.database.models.models import (
-    AdminInvite,
-    ChannelSettings,
+    ChannelConnectToken,
+    DeliveryBotSettings,
     SmartLink,
+    SmartLinkContentItem,
     SmartLinkFallbackFile,
+    SmartLinkResource,
     SmartLinkSource,
     SmartLinkSourceVisit,
     SmartLinkVisit,
@@ -12,10 +14,12 @@ from bot.database.models.models import (
 )
 
 __all__ = [
-    "AdminInvite",
-    "ChannelSettings",
+    "ChannelConnectToken",
+    "DeliveryBotSettings",
     "SmartLink",
+    "SmartLinkContentItem",
     "SmartLinkFallbackFile",
+    "SmartLinkResource",
     "SmartLinkSource",
     "SmartLinkSourceVisit",
     "SmartLinkVisit",

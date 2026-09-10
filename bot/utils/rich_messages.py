@@ -1,81 +1,38 @@
-from dataclasses import dataclass
-from html import escape
-from typing import Protocol
+from collections.abc import Callable
+from functools import wraps
+from typing import Any
 
-from aiogram.types import InputRichMessage, Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-
-@dataclass(frozen=True)
-class RichButton:
-    text: str
-    callback_data: str | None = None
-    url: str | None = None
-
-    def __post_init__(self) -> None:
-        if (self.callback_data is None) == (self.url is None):
-            raise ValueError("A rich button needs exactly one action")
+ButtonRows = list[list[InlineKeyboardButton]]
 
 
-RichButtons = list[list[RichButton]]
+def _button_text(text: str) -> str:
+    clean = text.strip()
+    if not clean:
+        raise ValueError("Button text cannot be empty")
+    return clean if len(clean) <= 64 else f"{clean[:63]}…"
 
 
-def is_rich_buttons(value: object) -> bool:
-    return isinstance(value, list) and all(
-        isinstance(button, RichButton)
-        for row in value
-        if isinstance(row, list)
-        for button in row
-    )
+def callback_button(text: str, callback_data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=_button_text(text), callback_data=callback_data)
 
 
-def callback_button(text: str, callback_data: str) -> RichButton:
-    return RichButton(text=text, callback_data=callback_data)
+def url_button(text: str, url: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=_button_text(text), url=url)
 
 
-def url_button(text: str, url: str) -> RichButton:
-    return RichButton(text=text, url=url)
+def inline_keyboard(rows: ButtonRows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def rich_message(text: str, buttons: RichButtons) -> InputRichMessage:
-    """Build a Bot API Rich Message with interactive buttons embedded in its HTML."""
-    rows = []
-    for row in buttons:
-        rendered = []
-        for button in row:
-            if button.callback_data is not None:
-                action = f'type="callback_data" data="{escape(button.callback_data, quote=True)}"'
-            else:
-                action = f'type="url" url="{escape(button.url or "", quote=True)}"'
-            rendered.append(f"<tg-button {action}>{escape(button.text)}</tg-button>")
-        rows.append(f"<tg-button-row>{''.join(rendered)}</tg-button-row>")
-    body = text or "<p></p>"
-    return InputRichMessage(html=f"{body}{''.join(rows)}")
+def as_markup(
+    factory: Callable[..., ButtonRows],
+) -> Callable[..., InlineKeyboardMarkup]:
+    """Adapt a keyboard row factory to aiogram's native markup type."""
 
+    @wraps(factory)
+    def wrapped(*args: Any, **kwargs: Any) -> InlineKeyboardMarkup:
+        return inline_keyboard(factory(*args, **kwargs))
 
-class RichMessageTarget(Protocol):
-    async def answer_rich(
-        self, rich_message: InputRichMessage, **kwargs: object
-    ) -> Message: ...
-
-
-async def answer_rich(
-    target: RichMessageTarget, text: str, buttons: RichButtons
-) -> Message:
-    return await target.answer_rich(rich_message(text, buttons))
-
-
-_message_answer = Message.answer
-
-
-async def _answer_with_rich_buttons(
-    self: Message, text: str, **kwargs: object
-) -> Message:
-    buttons = kwargs.pop("reply_markup", None)
-    if is_rich_buttons(buttons):
-        return await self.answer_rich(rich_message(text, buttons))
-    if buttons is not None:
-        kwargs["reply_markup"] = buttons
-    return await _message_answer(self, text, **kwargs)
-
-
-Message.answer = _answer_with_rich_buttons
+    return wrapped

@@ -62,6 +62,59 @@ class SmartLink(Base):
     sources: Mapped[list["SmartLinkSource"]] = relationship(
         back_populates="smart_link", cascade="all, delete-orphan"
     )
+    content_items: Mapped[list["SmartLinkContentItem"]] = relationship(
+        back_populates="smart_link",
+        cascade="all, delete-orphan",
+        order_by="SmartLinkContentItem.position",
+    )
+    resources: Mapped[list["SmartLinkResource"]] = relationship(
+        back_populates="smart_link",
+        cascade="all, delete-orphan",
+        order_by="SmartLinkResource.position",
+    )
+
+
+class SmartLinkContentItem(Base):
+    __tablename__ = "smart_link_content_items"
+    __table_args__ = (Index("ix_content_items_link", "smart_link_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    smart_link_id: Mapped[int] = mapped_column(
+        ForeignKey("smart_links.id"), nullable=False
+    )
+    content_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    text: Mapped[str | None] = mapped_column(Text)
+    caption: Mapped[str | None] = mapped_column(Text)
+    file_id: Mapped[str | None] = mapped_column(String(255))
+    relative_path: Mapped[str | None] = mapped_column(String(512))
+    original_filename: Mapped[str | None] = mapped_column(String(255))
+    mime_type: Mapped[str | None] = mapped_column(String(127))
+    file_size: Mapped[int | None] = mapped_column(BigInteger)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    smart_link: Mapped[SmartLink] = relationship(back_populates="content_items")
+
+
+class SmartLinkResource(Base):
+    __tablename__ = "smart_link_resources"
+    __table_args__ = (Index("ix_resources_link", "smart_link_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    smart_link_id: Mapped[int] = mapped_column(
+        ForeignKey("smart_links.id"), nullable=False
+    )
+    resource_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    title: Mapped[str] = mapped_column(String(128), nullable=False)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    github_owner: Mapped[str | None] = mapped_column(String(100))
+    github_repo: Mapped[str | None] = mapped_column(String(100))
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    smart_link: Mapped[SmartLink] = relationship(back_populates="resources")
 
 
 class SmartLinkSource(Base):
@@ -222,16 +275,34 @@ class SmartLinkSourceVisit(Base):
     source: Mapped[SmartLinkSource] = relationship(back_populates="visits")
 
 
-class ChannelSettings(Base):
-    __tablename__ = "channel_settings"
-    id: Mapped[int] = mapped_column(primary_key=True, default=1)
-    channel_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
-    title: Mapped[str] = mapped_column(String(255), nullable=False)
-    username: Mapped[str | None] = mapped_column(String(128))
-    invite_url: Mapped[str | None] = mapped_column(String(512))
+class DeliveryBotSettings(Base):
+    __tablename__ = "delivery_bot_settings"
+
+    owner_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
+    encrypted_token: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class ChannelConnectToken(Base):
+    __tablename__ = "channel_connect_tokens"
+    __table_args__ = (
+        Index("ix_channel_connect_token_hash", "token_hash", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class UserChannelSettings(Base):
@@ -248,19 +319,3 @@ class UserChannelSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
-
-
-class AdminInvite(Base):
-    __tablename__ = "admin_invites"
-    __table_args__ = (Index("ix_admin_invites_token", "token", unique=True),)
-    id: Mapped[int] = mapped_column(primary_key=True)
-    token: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
-    created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    used_by: Mapped[int | None] = mapped_column(BigInteger)
