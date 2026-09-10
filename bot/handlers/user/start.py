@@ -22,7 +22,7 @@ from bot.services.services import (
     send_stored_file,
 )
 from bot.services.storage_service import FileStorageService
-from bot.utils.rich_messages import answer_rich, footer_text, url_button
+from bot.utils.rich_messages import answer_rich, url_button
 from config import settings
 
 log = logging.getLogger(__name__)
@@ -55,7 +55,9 @@ async def _start_link(
 ) -> None:
     source = await SourceRepository(session).by_token(payload)
     if source and not source.is_active:
-        await message.answer("Эта ссылка больше не работает. Попросите у автора новую ссылку.")
+        await message.answer(
+            "Эта ссылка больше не работает. Попросите у автора новую ссылку."
+        )
         return
     link = (
         await LinkRepository(session).get(
@@ -65,7 +67,9 @@ async def _start_link(
         else await LinkRepository(session).by_slug(payload)
     )
     if not link or not link.is_active:
-        await message.answer("Эта ссылка больше не работает. Попросите у автора новую ссылку.")
+        await message.answer(
+            "Эта ссылка больше не работает. Попросите у автора новую ссылку."
+        )
         return
     bio = await _user_bio(bot, message.from_user.id)
     subscribed = await SubscriptionService(bot, session, link.created_by).check(
@@ -80,7 +84,9 @@ async def _start_link(
         source_id=source.id if source else None,
     )
     if subscribed is None:
-        await message.answer("Не удалось проверить подписку. Подождите немного и откройте ссылку ещё раз.")
+        await message.answer(
+            "Не удалось проверить подписку. Подождите немного и откройте ссылку ещё раз."
+        )
         return
     if source:
         await visits.touch_source(source.id, message.from_user.id, subscribed)
@@ -89,11 +95,15 @@ async def _start_link(
             await send_link_content(bot, message.chat.id, link, storage=storage)
         except FileNotFoundError:
             log.error("Smart-link file is missing: link_id=%s", link.id)
-            await message.answer("Материал временно недоступен. Попробуйте получить его немного позже.")
+            await message.answer(
+                "Материал временно недоступен. Попробуйте получить его немного позже."
+            )
         return
     url = _channel_url(await ChannelRepository(session).get(link.created_by))
     if not url:
-        await message.answer("Канал для подписки временно недоступен. Попробуйте открыть ссылку немного позже.")
+        await message.answer(
+            "Канал для подписки временно недоступен. Попробуйте открыть ссылку немного позже."
+        )
         return
     await answer_rich(
         message,
@@ -137,7 +147,9 @@ async def check_subscription(
     await callback.answer()
     link = await LinkRepository(session).get(callback_data.link_id, active_only=True)
     if not link:
-        await callback.message.answer("Эта ссылка больше не работает. Попросите у автора новую ссылку.")
+        await callback.message.answer(
+            "Эта ссылка больше не работает. Попросите у автора новую ссылку."
+        )
         return
     subscribed = await SubscriptionService(bot, session, link.created_by).check(
         callback.from_user.id
@@ -217,7 +229,6 @@ async def download_github_archive(
             FSInputFile(
                 archive.path, filename=f"{link.github_owner}-{link.github_repo}.zip"
             ),
-            caption=footer_text() or None,
         )
         await LinkRepository(session).increment_downloads(link)
         await progress.edit_text("Архив отправлен.")

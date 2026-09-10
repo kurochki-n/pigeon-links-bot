@@ -7,13 +7,13 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 log = logging.getLogger(__name__)
 
 COMMANDS = [
-    BotCommand(command="start", description="Мой кабинет"),
-    BotCommand(command="channel", description="Настройка канала"),
-    BotCommand(command="add", description="Создать умную ссылку"),
-    BotCommand(command="links", description="Умные ссылки"),
-    BotCommand(command="post", description="Создать пост"),
-    BotCommand(command="stats", description="Статистика"),
-    BotCommand(command="cancel", description="Отменить действие"),
+    BotCommand(command="start", description="Показать, с чего начать"),
+    BotCommand(command="channel", description="Подключить мой канал"),
+    BotCommand(command="add", description="Создать ссылку для материала"),
+    BotCommand(command="links", description="Мои ссылки и источники"),
+    BotCommand(command="post", description="Опубликовать пост в канале"),
+    BotCommand(command="stats", description="Посмотреть результаты"),
+    BotCommand(command="cancel", description="Отменить текущий шаг"),
 ]
 
 

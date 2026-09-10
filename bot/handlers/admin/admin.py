@@ -59,7 +59,7 @@ from bot.services.storage_service import FileStorageService
 from bot.states.flows import ChannelFlow, PostFlow, SmartLinkFlow, SourceFlow
 from bot.utils.admins_json import AdminStore, admin_label
 from bot.utils.html_report import create_report
-from bot.utils.rich_messages import callback_button, footer_text, url_button
+from bot.utils.rich_messages import callback_button, url_button
 from config import settings
 
 router = Router(name="admin")
@@ -224,8 +224,11 @@ async def channel(
         await state.set_state(ChannelFlow.value)
         await state.update_data(channel_request_id=CHANNEL_REQUEST_ID)
         await message.answer(
-            "Канал пока не настроен.\n\n"
-            "Добавьте бота в нужный канал в качестве администратора, затем нажмите «Выбрать канал».",
+            "<b>Сначала подключите канал.</b>\n\n"
+            "1. Откройте свой канал и добавьте этого бота как администратора.\n"
+            "2. Разрешите ему публиковать сообщения.\n"
+            "3. Вернитесь сюда и нажмите «Выбрать канал» внизу экрана.\n\n"
+            "Если канал закрытый, разрешите боту создавать пригласительные ссылки.",
             reply_markup=channel_selector(),
         )
         return
@@ -252,7 +255,7 @@ async def channel_input(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ChannelFlow.value)
     await state.update_data(channel_request_id=CHANNEL_REQUEST_ID)
     await callback.message.answer(
-        "Добавьте бота в нужный канал в качестве администратора, затем нажмите «Выбрать канал».",
+        "Добавьте бота в новый канал как администратора и разрешите ему публиковать сообщения. Затем нажмите «Выбрать канал» внизу экрана.",
         reply_markup=channel_selector(),
     )
 
@@ -271,9 +274,9 @@ async def channel_save(
     if not result.is_valid:
         await state.clear()
         await message.answer(
-            "Не удалось подключить канал.\n\n"
-            "Добавьте бота в канал в качестве администратора и выдайте ему права на публикацию "
-            "и создание ссылок-приглашений, затем попробуйте снова.",
+            "Не получилось подключить канал.\n\n"
+            "Проверьте, что бот добавлен в этот канал как администратор и может публиковать сообщения. "
+            "Для закрытого канала также разрешите ему создавать пригласительные ссылки. Затем попробуйте ещё раз.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
@@ -285,7 +288,10 @@ async def channel_save(
         invite_url=result.invite_url,
     )
     await state.clear()
-    await message.answer("Канал сохранён.", reply_markup=ReplyKeyboardRemove())
+    await message.answer(
+        "✅ Канал подключён! Теперь отправьте /add, чтобы создать ссылку и выдать материал подписчикам.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @router.message(ChannelFlow.value, F.text == "Отмена")
@@ -296,20 +302,28 @@ async def cancel_channel_selection(message: Message, state: FSMContext) -> None:
 
 @router.message(ChannelFlow.value)
 async def channel_selection_hint(message: Message) -> None:
-    await message.answer("Нажмите кнопку «Выбрать канал» ниже.")
+    await message.answer(
+        "Нажмите кнопку «Выбрать канал» внизу экрана. Telegram покажет список ваших каналов."
+    )
 
 
 @router.callback_query(ChannelCallback.filter(F.action == "delete"))
 async def channel_delete(callback: CallbackQuery, session: AsyncSession) -> None:
     await callback.answer()
     await ChannelRepository(session).delete()
-    await callback.message.answer("Настройка канала удалена.")
+    await callback.message.answer(
+        "Канал отключён. Пока не подключите новый канал через /channel, ссылки не смогут проверять подписку."
+    )
 
 
 @router.message(Command("add"))
 async def add_link(message: Message, state: FSMContext) -> None:
     await state.set_state(SmartLinkFlow.name)
-    await message.answer("Введите название умной ссылки.")
+    await message.answer(
+        "<b>Создадим ссылку для выдачи материала.</b>\n\n"
+        "Напишите её понятное название для себя. Его увидите только вы.\n"
+        "Например: «Реклама у блогера» или «Подарок с сайта»."
+    )
 
 
 @router.message(SmartLinkFlow.name)
@@ -319,7 +333,10 @@ async def link_name(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(name=message.text)
     await state.set_state(SmartLinkFlow.message)
-    await message.answer("Отправьте сообщение, которое увидит пользователь.")
+    await message.answer(
+        "Теперь напишите сообщение для человека. Он увидит его после подписки вместе с материалом.\n\n"
+        "Например: «Спасибо за подписку! Вот ваш подарок»."
+    )
 
 
 @router.message(SmartLinkFlow.message)
@@ -330,7 +347,8 @@ async def link_message(message: Message, state: FSMContext) -> None:
     await state.update_data(message_text=message.html_text)
     await state.set_state(SmartLinkFlow.material_type)
     await message.answer(
-        "Выберите тип полезного материала.", reply_markup=material_type_menu()
+        "Что человек должен получить после подписки? Выберите вариант ниже.",
+        reply_markup=material_type_menu(),
     )
 
 
@@ -341,7 +359,7 @@ async def choose_telegram_material(callback: CallbackQuery, state: FSMContext) -
     await callback.answer()
     await state.set_state(SmartLinkFlow.content)
     await callback.message.answer(
-        "Отправьте материал: текст, фото, видео, документ или animation."
+        "Пришлите сюда один материал: текст, фото, видео, документ или GIF. Бот сохранит его и будет отправлять подписчикам."
     )
 
 
@@ -351,7 +369,11 @@ async def choose_telegram_material(callback: CallbackQuery, state: FSMContext) -
 async def choose_github_material(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(SmartLinkFlow.github_url)
-    await callback.message.answer("Отправьте ссылку на публичный GitHub-репозиторий.")
+    await callback.message.answer(
+        "Пришлите ссылку на публичный проект GitHub. Она выглядит так:\n"
+        "https://github.com/владелец/название-проекта\n\n"
+        "После подписки человек сможет скачать свежий ZIP-архив этого проекта."
+    )
 
 
 @router.callback_query(
@@ -571,7 +593,11 @@ async def show_link_preview(
             bot, message.chat.id, type("C", (), preview)(), storage=storage
         )
     await state.set_state(SmartLinkFlow.preview)
-    await message.answer("Сохранить умную ссылку?", reply_markup=link_preview())
+    await message.answer(
+        "Проверьте сообщение выше. Если всё верно, нажмите «Сохранить и получить ссылку».\n"
+        "До нажатия этой кнопки ссылка ещё не создана.",
+        reply_markup=link_preview(),
+    )
 
 
 @router.callback_query(LinkCallback.filter(F.action == "preview_github"))
@@ -857,7 +883,10 @@ async def link_cancel(callback: CallbackQuery) -> None:
 
 @router.message(Command("stats"))
 async def stats(message: Message) -> None:
-    await message.answer("<b>Статистика</b>", reply_markup=stats_menu())
+    await message.answer(
+        "<b>Статистика</b>\n\nВыберите, какие результаты хотите посмотреть:",
+        reply_markup=stats_menu(),
+    )
 
 
 @router.callback_query(StatsCallback.filter(F.action.in_({"all", "one"})))
@@ -930,8 +959,7 @@ async def stats_report(
     )
     try:
         await callback.message.answer_document(
-            FSInputFile(path),
-            caption=footer_text("HTML-отчёт со статистикой") or None,
+            FSInputFile(path), caption="HTML-отчёт со статистикой"
         )
     finally:
         path.unlink(missing_ok=True)
@@ -940,7 +968,10 @@ async def stats_report(
 @router.message(Command("post"))
 async def post(message: Message, state: FSMContext) -> None:
     await state.set_state(PostFlow.content)
-    await message.answer("Отправьте содержимое публикации.")
+    await message.answer(
+        "<b>Создадим пост для канала.</b>\n\nПришлите сюда текст, фото, видео, документ или GIF. "
+        "Сначала вы увидите предпросмотр, и только потом сможете опубликовать пост."
+    )
 
 
 @router.message(PostFlow.content)
@@ -952,7 +983,9 @@ async def post_content(message: Message, state: FSMContext) -> None:
     await state.update_data(content=item, buttons=[])
     await state.set_state(PostFlow.button_choice)
     await message.answer(
-        "Добавить URL-кнопку в rich-сообщение?", reply_markup=post_choice()
+        "Хотите добавить кнопку со ссылкой под постом? Например, «Открыть сайт».\n"
+        "Если кнопка не нужна, выберите «Не добавлять кнопку».",
+        reply_markup=post_choice(),
     )
 
 
@@ -963,7 +996,9 @@ async def post_content(message: Message, state: FSMContext) -> None:
 async def post_button(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(PostFlow.button_text)
-    await callback.message.answer("Введите текст кнопки.")
+    await callback.message.answer(
+        "Напишите короткий текст для кнопки. Например: «Перейти на сайт» или «Скачать»."
+    )
 
 
 @router.message(PostFlow.button_text)
@@ -973,7 +1008,9 @@ async def post_button_text(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(button_text=message.text)
     await state.set_state(PostFlow.button_url)
-    await message.answer("Введите корректный URL (https://...).")
+    await message.answer(
+        "Теперь пришлите ссылку, куда должна вести кнопка. Она должна начинаться с https://"
+    )
 
 
 @router.message(PostFlow.button_url)
@@ -987,7 +1024,10 @@ async def post_button_url(message: Message, state: FSMContext) -> None:
     buttons = data["buttons"] + [(data["button_text"], message.text)]
     await state.update_data(buttons=buttons)
     await state.set_state(PostFlow.button_more)
-    await message.answer("Кнопка добавлена.", reply_markup=post_more())
+    await message.answer(
+        "✅ Кнопка добавлена. Можно добавить ещё одну или посмотреть пост перед публикацией.",
+        reply_markup=post_more(),
+    )
 
 
 @router.callback_query(
@@ -1003,7 +1043,11 @@ async def preview_post(callback: CallbackQuery, state: FSMContext, bot: Bot) -> 
         bot, callback.message.chat.id, type("C", (), data["content"])(), buttons
     )
     await state.set_state(PostFlow.preview)
-    await callback.message.answer("Опубликовать пост?", reply_markup=post_preview())
+    await callback.message.answer(
+        "Проверьте предпросмотр выше. Если всё верно, нажмите «Да, опубликовать в канал».\n"
+        "До этого пост не появится в канале.",
+        reply_markup=post_preview(),
+    )
 
 
 @router.callback_query(PostCallback.filter(F.action == "publish"), PostFlow.preview)
@@ -1013,7 +1057,9 @@ async def publish(
     await callback.answer()
     channel = await ChannelRepository(session).get()
     if not channel:
-        await callback.message.answer("Сначала настройте канал через /channel.")
+        await callback.message.answer(
+            "Сначала нужно подключить канал. Отправьте /channel, выберите канал, а затем создайте пост заново."
+        )
         return
     data = await state.get_data()
     buttons = [[url_button(text, url)] for text, url in data["buttons"]]
@@ -1027,7 +1073,7 @@ async def publish(
         )
         return
     await state.clear()
-    await callback.message.answer("Пост опубликован.")
+    await callback.message.answer("✅ Готово! Пост опубликован в подключённом канале.")
 
 
 @router.callback_query(PostCallback.filter(F.action == "restart"), PostFlow.preview)
@@ -1062,7 +1108,9 @@ async def cancel(
             return
         await message.answer("Действие отменено.")
     else:
-        await message.answer("Сейчас нет активного действия.")
+        await message.answer(
+            "Сейчас нечего отменять. Начните с /channel, чтобы подключить канал, или с /add, чтобы создать ссылку."
+        )
 
 
 @router.callback_query(PostCallback.filter(F.action == "cancel"))
